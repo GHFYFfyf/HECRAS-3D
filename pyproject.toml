@@ -1,0 +1,16 @@
+[project]
+name = "fastapi-hecras-project-manager"
+version = "0.1.0"
+description = "Single-user HEC-RAS HDF/TIF project manager"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+	"fastapi[standard]>=0.135.1",
+	"sqlalchemy>=2.0.48",
+	"h5py>=3.14.0",
+	"matplotlib>=3.10.8",
+	"rasterio>=1.4.4",
+]
+
+[tool.uv]
+package = false

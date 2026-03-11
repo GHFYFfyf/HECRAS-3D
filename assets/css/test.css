@@ -1,0 +1,71 @@
+:root {
+    --bg-canvas: #0d1117;
+    --bg-elevated: #010409;
+    --bg-panel: #161b22;
+    --bg-panel-hover: #1c2128;
+    --border-default: #30363d;
+    --border-muted: #21262d;
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --accent: #2f81f7;
+}
+
+body {
+    background-color: var(--bg-canvas);
+    color: var(--text-primary);
+    font-family: "Inter", sans-serif;
+    overflow: hidden;
+}
+
+.glass-header {
+    background: linear-gradient(180deg, #161b22 0%, #0d1117 72%, #010409 100%);
+}
+
+.card-bg {
+    background-color: var(--bg-panel);
+    border: 1px solid var(--border-default);
+    box-shadow: 0 0 0 1px rgba(1, 4, 9, 0.15);
+    transition: all 0.2s ease;
+}
+
+.card-bg:hover {
+    border-color: var(--accent);
+    background-color: var(--bg-panel-hover);
+}
+
+.divider {
+    border-right: 1px solid var(--border-default);
+}
+
+.section-divider {
+    border-bottom: 1px solid var(--border-default);
+}
+
+.earth-container {
+    background:
+        radial-gradient(circle at 50% 42%, rgba(47, 129, 247, 0.08) 0%, rgba(47, 129, 247, 0.02) 22%, rgba(13, 17, 23, 0) 42%),
+        radial-gradient(circle at center, #11161d 0%, #0d1117 58%, #010409 100%);
+    position: relative;
+}
+
+input::placeholder {
+    color: var(--text-secondary);
+}
+/* 发光环的旋转动画 */
+@keyframes spin-slow {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+/* 针对 HTML 中 animate-[spin_100s_linear_infinite] 的原生支持 */
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+/* 增强发光感：调整径向渐变 */
+.earth-container {
+    background: 
+        radial-gradient(circle at center, rgba(59, 130, 246, 0.15) 0%, rgba(11, 14, 20, 1) 70%); /* 增加中心亮度 */
+    position: relative;
+}
