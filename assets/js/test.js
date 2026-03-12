@@ -1,6 +1,12 @@
 document.addEventListener("DOMContentLoaded", async () => {
     console.info("HEC-RAS dashboard template loaded.");
-    console.log("hello");
+
+    const PROJECT_FOCUS_DISTANCE_FACTOR = 1.002;
+
+    let autoRotateEnabled = true;
+    let autoRotateHandler;
+    const projectExtentEntities = new Map();
+    let activeProjectId = null;
 
     // Grant CesiumJS access to your ion assets
     Cesium.Ion.defaultAccessToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiIwMjc0YjQ0MS0wOTliLTQ3ZGQtYmZhMi05YTdlYTM5MWUyYmUiLCJpZCI6MzQ5Mjk1LCJpYXQiOjE3NjExODM2Njl9.xKRoBHBK6rfDy85asmx50omBvFw96N48Vq0Z85U9hys";
@@ -62,8 +68,144 @@ document.addEventListener("DOMContentLoaded", async () => {
         }
     });
 
+    function stopAutoRotate() {
+        autoRotateEnabled = false;
+    }
+
+    function mercatorPointToCartographic(x, y) {
+        const projection = new Cesium.WebMercatorProjection();
+        return projection.unproject(new Cesium.Cartesian3(x, y, 0.0));
+    }
+
+    function buildRectangleFromProject(project) {
+        const minx = Number(project?.bbox_minx);
+        const miny = Number(project?.bbox_miny);
+        const maxx = Number(project?.bbox_maxx);
+        const maxy = Number(project?.bbox_maxy);
+
+        if (![minx, miny, maxx, maxy].every(Number.isFinite)) {
+            return null;
+        }
+
+        const southwest = mercatorPointToCartographic(minx, miny);
+        const northeast = mercatorPointToCartographic(maxx, maxy);
+        const west = Math.min(southwest.longitude, northeast.longitude);
+        const south = Math.min(southwest.latitude, northeast.latitude);
+        const east = Math.max(southwest.longitude, northeast.longitude);
+        const north = Math.max(southwest.latitude, northeast.latitude);
+
+        return new Cesium.Rectangle(west, south, east, north);
+    }
+
+    function getExtentStyle(isActive) {
+        if (isActive) {
+            return {
+                material: Cesium.Color.CYAN.withAlpha(0.14),
+                outlineColor: Cesium.Color.CYAN.withAlpha(0.96),
+                outlineWidth: 3,
+            };
+        }
+
+        return {
+            material: Cesium.Color.CYAN.withAlpha(0.03),
+            outlineColor: Cesium.Color.CYAN.withAlpha(0.35),
+            outlineWidth: 1,
+        };
+    }
+
+    function applyExtentStyle(entity, isActive) {
+        const style = getExtentStyle(isActive);
+        entity.rectangle.material = style.material;
+        entity.rectangle.outlineColor = style.outlineColor;
+        entity.rectangle.outlineWidth = style.outlineWidth;
+    }
+
+    function renderProjectExtents(projects) {
+        const seenIds = new Set();
+
+        (projects || []).forEach((project) => {
+            const rectangle = buildRectangleFromProject(project);
+            if (!rectangle) {
+                return;
+            }
+
+            const projectId = String(project.id);
+            seenIds.add(projectId);
+
+            if (!projectExtentEntities.has(projectId)) {
+                const entity = viewer.entities.add({
+                    name: `${project?.name || "project"}-extent`,
+                    rectangle: {
+                        coordinates: rectangle,
+                        material: Cesium.Color.CYAN.withAlpha(0.03),
+                        outline: true,
+                        outlineColor: Cesium.Color.CYAN.withAlpha(0.35),
+                        outlineWidth: 1,
+                        height: 0.0,
+                    },
+                });
+                projectExtentEntities.set(projectId, entity);
+            } else {
+                projectExtentEntities.get(projectId).rectangle.coordinates = rectangle;
+            }
+        });
+
+        projectExtentEntities.forEach((entity, projectId) => {
+            if (!seenIds.has(projectId)) {
+                viewer.entities.remove(entity);
+                projectExtentEntities.delete(projectId);
+                return;
+            }
+
+            applyExtentStyle(entity, projectId === activeProjectId);
+        });
+    }
+
+    window.focusProjectOnGlobe = (project) => {
+        const rectangle = buildRectangleFromProject(project);
+
+        if (!rectangle) {
+            console.warn("Project bbox is incomplete, cannot focus globe.", project);
+            return;
+        }
+
+        stopAutoRotate();
+
+        activeProjectId = String(project.id);
+        renderProjectExtents(window.projectCardsData || []);
+
+        const rectangleDestination = viewer.camera.getRectangleCameraCoordinates(rectangle);
+        const adjustedDestination = Cesium.Cartesian3.multiplyByScalar(
+            rectangleDestination,
+            PROJECT_FOCUS_DISTANCE_FACTOR,
+            new Cesium.Cartesian3(),
+        );
+
+        viewer.camera.flyTo({
+            destination: adjustedDestination,
+            orientation: {
+                heading: 0.0,
+                pitch: -Cesium.Math.PI_OVER_TWO,
+                roll: 0.0,
+            },
+            duration: 1.6,
+        });
+    };
+
     // 地球自转效果
-    viewer.clock.onTick.addEventListener(() => {
-        viewer.camera.rotate(Cesium.Cartesian3.UNIT_Z, 0.002); // 调整数值改变自转速度
+    autoRotateHandler = () => {
+        if (!autoRotateEnabled) {
+            return;
+        }
+        viewer.camera.rotate(Cesium.Cartesian3.UNIT_Z, 0.002);
+    };
+    viewer.clock.onTick.addEventListener(autoRotateHandler);
+
+    window.addEventListener("projects:loaded", (event) => {
+        renderProjectExtents(event.detail || []);
     });
+
+    if (Array.isArray(window.projectCardsData) && window.projectCardsData.length > 0) {
+        renderProjectExtents(window.projectCardsData);
+    }
 });

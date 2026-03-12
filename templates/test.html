@@ -5,101 +5,85 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HEC-RAS 3D 智能管理平台</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="../assets/css/test.css">
+    <script src="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Cesium.js"></script>
+    <link href="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+    <link rel="stylesheet" href="/assets/css/test.css">
 </head>
 <body class="h-screen flex flex-col">
 
-    <header class="glass-header py-6 px-8 border-b border-[#14161a]">
-        <div class="max-w-full mx-auto grid grid-cols-3 items-center gap-6">
-
+    <header class="glass-header py-6 px-8 border-b border-gray-800">
+        <div class="max-w-full mx-auto grid grid-cols-3 items-center">
+            
             <div class="flex flex-col">
-                <h1 class="text-xl font-semibold tracking-[0.18em] uppercase">HEC-RAS <span class="text-zinc-300">3D</span></h1>
-                <p class="text-gray-500 text-[10px] font-mono leading-tight tracking-[0.35em]">RESERVOIR ANALYSIS CONSOLE</p>
+                <h1 class="text-xl font-bold tracking-tight">HEC-RAS <span class="text-blue-500">3D</span></h1>
+                <p class="text-gray-500 text-[10px] font-mono leading-tight">INTELLIGENT ANALYSIS</p>
             </div>
 
             <div class="relative w-full max-w-xl mx-auto">
-                <input type="text"
-                       placeholder="搜索项目或让 AI 分析水库成果数据..."
-                       class="input-dark w-full rounded-full py-2.5 px-6 text-sm shadow-lg focus:outline-none">
-                <button class="btn-light absolute right-2 top-1.5 text-[11px] px-4 py-1.5 rounded-full transition-colors">
+                <input type="text" 
+                       placeholder="🤖 尝试搜索项目或让 AI 分析 HDF 数据..." 
+                       class="w-full bg-[#0d1117] border border-gray-700 rounded-full py-2.5 px-6 text-sm text-white focus:outline-none focus:ring-1 focus:ring-blue-600 focus:border-transparent shadow-lg">
+                <button class="absolute right-2 top-1.5 bg-blue-600 hover:bg-blue-500 text-white text-[11px] px-4 py-1.5 rounded-full transition-colors">
                     AI 检索
                 </button>
             </div>
 
-            <div class="flex justify-end">
-                <span class="status-pill">Dark View</span>
-            </div>
-
+            <div></div>
+            
         </div>
     </header>
 
     <main class="flex-1 flex overflow-hidden">
-
-        <section class="w-[38%] flex flex-col p-6 overflow-y-auto divider">
+        
+        <section class="w-[40%] flex flex-col p-6 overflow-y-auto divider">
             <div class="flex justify-between items-center mb-6">
-                <h2 class="text-lg font-semibold flex items-center text-gray-100">
-                    <span class="w-1 h-5 bg-zinc-300 mr-3 rounded-full opacity-80"></span>项目库
+                <h2 class="text-lg font-semibold flex items-center">
+                    <span class="w-1 h-5 bg-blue-500 mr-2 rounded-full"></span>项目库
                 </h2>
-
-                <span class="status-pill">1 个项目</span>
-            </div>
-
-            <div class="space-y-4">
-                <div class="card-bg card-active rounded-2xl p-5 cursor-pointer group">
-                    <div class="flex space-x-4">
-                        <div class="thumb-panel w-32 h-20 rounded-xl flex-shrink-0 flex items-center justify-center">
-                            <span class="text-[10px] text-gray-500 font-mono tracking-[0.3em]">FUCHUNJIANG</span>
-                        </div>
-                        <div class="min-w-0 flex-1">
-                            <div class="flex items-center gap-2 flex-wrap">
-                                <h3 class="text-sm font-medium text-gray-100 truncate transition-colors">富春江水库</h3>
-                                <span class="label-chip">退水</span>
-                            </div>
-                            <p class="text-[11px] text-gray-500 mt-2">关联成果: Fuchunjiang_Drawdown.hdf</p>
-                            <p class="text-[11px] text-gray-600 mt-1">当前场景已切换为单项目展示模式</p>
-                        </div>
+                
+                <div class="flex items-center space-x-2">
+                    <div class="relative">
+                        <input type="text" placeholder="查找..." class="bg-gray-800/50 border border-gray-700 rounded px-3 py-1.5 text-xs focus:outline-none focus:border-blue-500 w-32">
+                        <span class="absolute right-2 top-2 opacity-30 text-[10px]">🔍</span>
                     </div>
+                    <button class="bg-blue-600 hover:bg-blue-500 text-white text-xs px-3 py-1.5 rounded flex items-center gap-1 transition-all">
+                        新建项目
+                    </button>
                 </div>
             </div>
+
+            <div id="projectCardList" class="space-y-4"></div>
         </section>
 
-        <section class="w-[62%] flex flex-col overflow-hidden">
-
-            <div class="h-1/4 section-divider bg-black/20 p-4">
+        <section class="w-[60%] flex flex-col overflow-hidden">
+            
+            <div class="h-1/4 section-divider bg-[#0f1420]/30 p-4">
                 <div class="flex justify-between items-center mb-4">
-                    <span class="text-[10px] font-bold text-gray-500 uppercase tracking-[0.4em]">Hydraulic Statistics</span>
+                    <span class="text-[10px] font-bold text-gray-500 uppercase tracking-widest">Hydraulic Statistics</span>
                     <div class="flex gap-4">
-                        <div class="flex items-center gap-1.5"><span class="stat-dot"></span><span class="text-[10px] text-gray-400">退水速率</span></div>
-                        <div class="flex items-center gap-1.5"><span class="stat-dot stat-dot--muted"></span><span class="text-[10px] text-gray-400">库水位</span></div>
+                        <div class="flex items-center gap-1.5"><span class="w-2 h-2 bg-blue-500 rounded-full"></span><span class="text-[10px] text-gray-400">流速</span></div>
+                        <div class="flex items-center gap-1.5"><span class="w-2 h-2 bg-gray-600 rounded-full"></span><span class="text-[10px] text-gray-400">水位</span></div>
                     </div>
                 </div>
                 <div class="w-full h-16 flex items-end justify-around px-8">
-                    <div class="w-12 stat-bar h-[38%]"></div>
-                    <div class="w-12 stat-bar h-[62%]"></div>
-                    <div class="w-12 stat-bar is-active h-[48%] animate-pulse"></div>
-                    <div class="w-12 stat-bar h-[76%]"></div>
-                    <div class="w-12 stat-bar h-[34%]"></div>
+                    <div class="w-12 bg-blue-600/30 border-t border-blue-500 h-[40%]"></div>
+                    <div class="w-12 bg-blue-600/30 border-t border-blue-500 h-[70%]"></div>
+                    <div class="w-12 bg-blue-600/30 border-t border-blue-500 h-[55%] animate-pulse"></div>
+                    <div class="w-12 bg-blue-600/30 border-t border-blue-500 h-[85%]"></div>
+                    <div class="w-12 bg-blue-600/30 border-t border-blue-500 h-[30%]"></div>
                 </div>
             </div>
 
-            <div class="h-3/4 earth-container">
-                <div class="absolute inset-0 flex flex-col items-center justify-center opacity-90">
-                    <div class="viewport-ring w-72 h-72 rounded-full"></div>
-                    <p class="mt-6 text-[10px] text-gray-400 font-mono tracking-[0.5em] font-semibold">CESIUM_CORE_VIEWPORT</p>
-                </div>
-
-                <div class="absolute top-4 left-4">
-                    <div class="engine-status px-3 py-1 rounded text-[10px] text-gray-400 flex items-center gap-2">
-                        <span class="engine-status__dot w-1.5 h-1.5 rounded-full"></span>
-                        Render Engine Status: <span class="text-gray-100">Optimal</span>
-                    </div>
-                </div>
+            <div class="h-3/4 earth-container relative" id="cesiumContainer">
             </div>
 
         </section>
 
     </main>
 
+    <div id="deleteProjectModalRoot"></div>
+
 </body>
-<script src="../assets/js/test.js"></script>
+<script src="/assets/js/project-cards.js"></script>
+<script src="/assets/js/test.js"></script>
 </html>
