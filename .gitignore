@@ -1,8 +1,15 @@
 __pycache__/
 *.py[cod]
+*$py.class
+
+build/
+dist/
+*.egg-info/
 
 .venv/
 .python-version
+.env
+.env.*
 
 .pytest_cache/
 .mypy_cache/
@@ -12,7 +19,17 @@ __pycache__/
 htmlcov/
 
 flood_manager.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite3
 resource/cache/
 
+.vscode/settings.json
+.vscode/launch.json
+.vscode/*.code-workspace
 .idea/
 .DS_Store
+*.log
+*.tmp
+*.swp
