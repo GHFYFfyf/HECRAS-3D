@@ -1,35 +1,61 @@
+# Python bytecode / caches
 __pycache__/
 *.py[cod]
 *$py.class
+.ipynb_checkpoints/
 
+# Build / packaging
 build/
 dist/
 *.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
 
+# Virtual environments / local env
 .venv/
+venv/
+env/
+ENV/
 .python-version
 .env
 .env.*
+!.env.example
 
+# Test / type / lint / coverage caches
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
 .coverage
 .coverage.*
 htmlcov/
+coverage.xml
 
-flood_manager.db
+# Local databases / runtime artifacts
+*.db
 *.db-journal
 *.db-wal
 *.db-shm
+*.sqlite
 *.sqlite3
-resource/cache/
-
-.vscode/settings.json
-.vscode/launch.json
-.vscode/*.code-workspace
-.idea/
-.DS_Store
 *.log
 *.tmp
 *.swp
+*.swo
+*.pid
+
+# Project-local scratch / generated files
+resource/
+temp/
+snippets.txt
+uv.lock
+
+# Editor / IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -214,9 +214,7 @@
 
         openButton.addEventListener("click", (event) => {
             event.stopPropagation();
-            if (typeof window.focusProjectOnGlobe === "function") {
-                window.focusProjectOnGlobe(project);
-            }
+            window.location.href = `/three?project_id=${encodeURIComponent(project.id)}`;
         });
 
         deleteButton.addEventListener("click", async (event) => {
