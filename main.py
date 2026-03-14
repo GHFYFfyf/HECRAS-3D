@@ -7,6 +7,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+import h5py
 import rasterio
 import numpy as np
 from sqlalchemy import select
@@ -184,3 +185,151 @@ def get_project_tif_points(
 			"vertices": vertices,
 			"points": points,
 		}
+
+
+@app.get("/api/projects/{project_id}/hdf-water-depth")
+def get_project_hdf_water_depth(
+	project_id: int,
+	time_index: int = Query(default=-1, ge=-1),
+	max_points: int = Query(default=80000, ge=1000, le=300000),
+	include_dry: bool = Query(default=False),
+	db: Session = Depends(get_db),
+) -> dict[str, object]:
+	project = db.get(Project, project_id)
+	if project is None:
+		raise HTTPException(status_code=404, detail="Project not found")
+
+	hdf_path = (BASE_DIR / project.hdf_path).resolve()
+	if not hdf_path.exists():
+		raise HTTPException(status_code=404, detail="HDF file not found")
+
+	cell_center_ref = project.cell_center_ref or "Geometry/2D Flow Areas/Perimeter 1/Cells Center Coordinate"
+	bed_elevation_ref = project.bed_elevation_ref or "Geometry/2D Flow Areas/Perimeter 1/Cells Minimum Elevation"
+	water_surface_ref = project.water_surface_ref or (
+		"Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/"
+		"2D Flow Areas/Perimeter 1/Water Surface"
+	)
+
+	with h5py.File(hdf_path, "r") as hdf:
+		if cell_center_ref not in hdf:
+			raise HTTPException(status_code=400, detail=f"Missing HDF path: {cell_center_ref}")
+		if bed_elevation_ref not in hdf:
+			raise HTTPException(status_code=400, detail=f"Missing HDF path: {bed_elevation_ref}")
+		if water_surface_ref not in hdf:
+			raise HTTPException(status_code=400, detail=f"Missing HDF path: {water_surface_ref}")
+
+		coords = np.asarray(hdf[cell_center_ref][:], dtype=np.float64)
+		bed = np.asarray(hdf[bed_elevation_ref][:], dtype=np.float64)
+		water_surface_all = np.asarray(hdf[water_surface_ref][:], dtype=np.float64)
+
+	if coords.ndim != 2 or coords.shape[1] < 2:
+		raise HTTPException(status_code=400, detail="Invalid cell center coordinates shape")
+	if bed.ndim != 1:
+		raise HTTPException(status_code=400, detail="Invalid bed elevation shape")
+	if water_surface_all.ndim != 2:
+		raise HTTPException(status_code=400, detail="Invalid water surface shape")
+
+	cell_count = int(coords.shape[0])
+	time_step_count = int(water_surface_all.shape[0])
+
+	if time_step_count == 0 or cell_count == 0:
+		return {
+			"project_id": project_id,
+			"time_index": -1,
+			"time_step_count": time_step_count,
+			"point_count": 0,
+			"stride": 1,
+			"metadata": {
+				"source": str(project.hdf_path),
+				"cell_center_ref": cell_center_ref,
+				"bed_elevation_ref": bed_elevation_ref,
+				"water_surface_ref": water_surface_ref,
+			},
+			"points": [],
+		}
+
+	resolved_time_index = time_step_count - 1 if time_index < 0 else time_index
+	if resolved_time_index < 0 or resolved_time_index >= time_step_count:
+		raise HTTPException(
+			status_code=400,
+			detail=f"time_index out of range: {resolved_time_index}, valid [0, {time_step_count - 1}]",
+		)
+
+	if bed.shape[0] != cell_count or water_surface_all.shape[1] != cell_count:
+		raise HTTPException(status_code=400, detail="Inconsistent HDF dataset sizes")
+
+	water_surface = water_surface_all[resolved_time_index]
+	depth = water_surface - bed
+
+	finite_mask = (
+		np.isfinite(coords[:, 0])
+		& np.isfinite(coords[:, 1])
+		& np.isfinite(bed)
+		& np.isfinite(water_surface)
+		& np.isfinite(depth)
+	)
+	if include_dry:
+		valid_mask = finite_mask
+	else:
+		valid_mask = finite_mask & (depth > 0.0)
+
+	valid_indices = np.flatnonzero(valid_mask)
+	valid_count = int(valid_indices.size)
+
+	if valid_count == 0:
+		return {
+			"project_id": project_id,
+			"time_index": resolved_time_index,
+			"time_step_count": time_step_count,
+			"point_count": 0,
+			"stride": 1,
+			"metadata": {
+				"source": str(project.hdf_path),
+				"cell_center_ref": cell_center_ref,
+				"bed_elevation_ref": bed_elevation_ref,
+				"water_surface_ref": water_surface_ref,
+			},
+			"points": [],
+		}
+
+	stride = max(1, int(np.ceil(np.sqrt(valid_count / max_points))))
+	sampled_indices = valid_indices[::stride]
+
+	x_vals = coords[sampled_indices, 0]
+	y_vals = coords[sampled_indices, 1]
+	bed_vals = bed[sampled_indices]
+	water_surface_vals = water_surface[sampled_indices]
+	depth_vals = depth[sampled_indices]
+
+	points = [
+		[
+			float(x),
+			float(y),
+			float(bed_z),
+			float(water_z),
+			float(depth_value),
+		]
+		for x, y, bed_z, water_z, depth_value in zip(
+			x_vals,
+			y_vals,
+			bed_vals,
+			water_surface_vals,
+			depth_vals,
+			strict=False,
+		)
+	]
+
+	return {
+		"project_id": project_id,
+		"time_index": resolved_time_index,
+		"time_step_count": time_step_count,
+		"point_count": len(points),
+		"stride": stride,
+		"metadata": {
+			"source": str(project.hdf_path),
+			"cell_center_ref": cell_center_ref,
+			"bed_elevation_ref": bed_elevation_ref,
+			"water_surface_ref": water_surface_ref,
+		},
+		"points": points,
+	}
