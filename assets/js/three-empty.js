@@ -217,10 +217,10 @@
             geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
 
             const material = new THREE.PointsMaterial({
-                size: 2.8,
+                size: 0.8,
                 sizeAttenuation: true,
                 color: 0xffffff,
-                opacity: 0.95,
+                opacity: 0.6,
                 transparent: true,
             });
 
@@ -486,6 +486,20 @@
         const loadStartAt = performance.now();
         RenderModule.init();
 
+        // Expose renderer primitives early so overlay scripts can wait on a stable handle.
+        window.ThreeOverlayBridge = {
+            scene: RenderModule.scene,
+            camera: RenderModule.camera,
+            renderer: RenderModule.renderer,
+            controls: RenderModule.controls,
+            ready: false,
+            centerX: 0,
+            centerY: 0,
+            minZ: 0,
+            maxZ: 1,
+            zRange: 1,
+        };
+
         projectId = await DataModule.resolveProjectId(projectId, params);
         const payload = await DataModule.fetchTifPayload(projectId);
         // Dev-only logs: useful for inspection, but can be expensive with frequent reloads.
@@ -511,6 +525,25 @@
         if (triangleLines) {
             RenderModule.scene.add(triangleLines);
         }
+
+        // Update bridge with model-space transform so XY-aligned overlays can share this scene.
+        window.ThreeOverlayBridge = {
+            scene: RenderModule.scene,
+            camera: RenderModule.camera,
+            renderer: RenderModule.renderer,
+            controls: RenderModule.controls,
+            ready: true,
+            centerX,
+            centerY,
+            minZ,
+            maxZ: minZ + zRange,
+            zRange,
+        };
+        window.dispatchEvent(
+            new CustomEvent("three-base-ready", {
+                detail: window.ThreeOverlayBridge,
+            }),
+        );
 
         RenderModule.fitCameraToPoints(positions);
         const elapsedMs = performance.now() - loadStartAt;
