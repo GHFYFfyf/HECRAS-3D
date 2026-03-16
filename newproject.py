@@ -10,9 +10,9 @@ from sqlalchemy import select
 from database import SessionLocal, engine
 from models import Base, Project
 
-PROJECT_NAME = "shuiku"
-TIF_PATH = "resource/hdf/shuiku.sk.tif"
-HDF_PATH = "resource/hdf/shuiku.p01.hdf"
+PROJECT_NAME = "changjiang"
+TIF_PATH = "resource/hdf/tif.tif"
+HDF_PATH = "resource/hdf/ChangJ.p01.hdf"
 
 CELL_CENTER_REF = "Geometry/2D Flow Areas/Perimeter 1/Cells Center Coordinate"
 BED_ELEVATION_REF = "Geometry/2D Flow Areas/Perimeter 1/Cells Minimum Elevation"

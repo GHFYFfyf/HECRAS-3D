@@ -117,10 +117,12 @@
 
     function updateProjectState(projects) {
         window.projectCardsData = projects;
+        // Send (frontend event bus): broadcast loaded card data to other UI modules.
         window.dispatchEvent(new CustomEvent("projects:loaded", { detail: projects }));
     }
 
     async function deleteProject(projectId) {
+        // Send: DELETE /api/projects/{projectId} to backend, path carries delete target id.
         const response = await fetch(`${DELETE_API_BASE}/${projectId}`, {
             method: "DELETE",
             headers: { Accept: "application/json" }
@@ -129,6 +131,9 @@
         if (!response.ok) {
             throw new Error(`Failed to delete project: ${response.status}`);
         }
+
+        // Receive: backend returns { ok: true } to indicate deletion success.
+        await response.json();
     }
 
     async function openDeleteModal(project) {
@@ -240,10 +245,13 @@
     }
 
     async function fetchProjects() {
+        // Send: GET /api/projects/cards to backend, requesting card fields for list rendering.
         const response = await fetch(CARDS_API, { headers: { Accept: "application/json" } });
         if (!response.ok) {
             throw new Error(`Failed to fetch project cards: ${response.status}`);
         }
+
+        // Receive: backend card list JSON consumed by renderProjectCards.
         return response.json();
     }
 

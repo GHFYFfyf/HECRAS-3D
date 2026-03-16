@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
+from time import perf_counter
+from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
@@ -18,6 +21,72 @@ from models import Project
 
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+_HDF_STATIC_CACHE_LOCK = Lock()
+_HDF_STATIC_CACHE: dict[tuple[str, int, str, str, str], dict[str, Any]] = {}
+
+
+def _get_hdf_static_data(
+	hdf_path: Path,
+	cell_center_ref: str,
+	bed_elevation_ref: str,
+	water_surface_ref: str,
+) -> dict[str, Any]:
+	"""Load and cache HDF datasets that do not change per time index."""
+	hdf_stat = hdf_path.stat()
+	cache_key = (
+		str(hdf_path),
+		int(hdf_stat.st_mtime_ns),
+		cell_center_ref,
+		bed_elevation_ref,
+		water_surface_ref,
+	)
+
+	with _HDF_STATIC_CACHE_LOCK:
+		cached = _HDF_STATIC_CACHE.get(cache_key)
+	if cached is not None:
+		return cached
+
+	with h5py.File(hdf_path, "r") as hdf:
+		if cell_center_ref not in hdf:
+			raise HTTPException(status_code=400, detail=f"Missing HDF path: {cell_center_ref}")
+		if bed_elevation_ref not in hdf:
+			raise HTTPException(status_code=400, detail=f"Missing HDF path: {bed_elevation_ref}")
+		if water_surface_ref not in hdf:
+			raise HTTPException(status_code=400, detail=f"Missing HDF path: {water_surface_ref}")
+
+		coords = np.asarray(hdf[cell_center_ref][:], dtype=np.float32)
+		bed = np.asarray(hdf[bed_elevation_ref][:], dtype=np.float32)
+		water_surface_ds = hdf[water_surface_ref]
+
+		if coords.ndim != 2 or coords.shape[1] < 2:
+			raise HTTPException(status_code=400, detail="Invalid cell center coordinates shape")
+		if bed.ndim != 1:
+			raise HTTPException(status_code=400, detail="Invalid bed elevation shape")
+		if water_surface_ds.ndim != 2:
+			raise HTTPException(status_code=400, detail="Invalid water surface shape")
+
+		cell_count = int(coords.shape[0])
+		time_step_count = int(water_surface_ds.shape[0])
+		if bed.shape[0] != cell_count or int(water_surface_ds.shape[1]) != cell_count:
+			raise HTTPException(status_code=400, detail="Inconsistent HDF dataset sizes")
+
+	static_data = {
+		"coords": coords,
+		"bed": bed,
+		"cell_count": cell_count,
+		"time_step_count": time_step_count,
+	}
+
+	# Drop stale entries for the same file to keep cache bounded when HDF is updated.
+	with _HDF_STATIC_CACHE_LOCK:
+		stale_keys = [key for key in _HDF_STATIC_CACHE if key[0] == str(hdf_path) and key != cache_key]
+		for stale_key in stale_keys:
+			_HDF_STATIC_CACHE.pop(stale_key, None)
+		_HDF_STATIC_CACHE[cache_key] = static_data
+
+	return static_data
 
 app = FastAPI(title="HEC-RAS 3D Project Manager")
 app.mount("/assets", StaticFiles(directory=BASE_DIR / "assets"), name="assets")
@@ -45,6 +114,7 @@ def three_page() -> HTMLResponse:
 def get_project_cards(
 	db: Session = Depends(get_db),
 ) -> list[dict[str, int | float | str | None]]:
+	# Receive: frontend GET /api/projects/cards, no body, used by project card list.
 	projects = db.execute(select(Project).order_by(Project.created_at.desc())).scalars().all()
 	result: list[dict[str, int | float | str | None]] = []
 
@@ -68,17 +138,20 @@ def get_project_cards(
 			}
 		)
 
+	# Send: card list JSON to frontend assets/js/project-cards.js (fetchProjects).
 	return result
 
 
 @app.delete("/api/projects/{project_id}")
 def delete_project(project_id: int, db: Session = Depends(get_db)) -> dict[str, bool]:
+	# Receive: frontend DELETE /api/projects/{project_id}, path param is the target project id.
 	project = db.get(Project, project_id)
 	if project is None:
 		raise HTTPException(status_code=404, detail="Project not found")
 
 	db.delete(project)
 	db.commit()
+	# Send: deletion result flag back to frontend assets/js/project-cards.js (deleteProject).
 	return {"ok": True}
 
 
@@ -88,6 +161,7 @@ def get_project_tif_points(
 	max_points: int = Query(default=80000, ge=1000, le=300000),
 	db: Session = Depends(get_db),
 ) -> dict[str, object]:
+	# Receive: frontend GET /api/projects/{project_id}/tif-points with project_id + max_points query.
 	project = db.get(Project, project_id)
 	if project is None:
 		raise HTTPException(status_code=404, detail="Project not found")
@@ -102,6 +176,7 @@ def get_project_tif_points(
 		valid_count = int(valid_mask.sum())
 
 		if valid_count == 0:
+			# Send: empty point payload to frontend renderer when tif has no valid cells.
 			return {
 				"project_id": project_id,
 				"metadata": {
@@ -134,7 +209,8 @@ def get_project_tif_points(
 		sample_col_flat = sample_col_idx.ravel()
 
 		valid_flat = valid_mask[rows, cols]
-		z_values = np.asarray(np.ma.filled(band[rows, cols], np.nan), dtype=np.float64)
+		sampled_band = band[rows, cols].astype(np.float64)
+		z_values = np.asarray(np.ma.filled(sampled_band, np.nan), dtype=np.float64)
 		x_vals, y_vals = rasterio.transform.xy(src.transform, rows, cols, offset="center")
 
 		vertices = [
@@ -167,6 +243,7 @@ def get_project_tif_points(
 			if bool(valid)
 		]
 
+		# Send: sampled terrain points/vertices JSON to frontend three.js overlay consumers.
 		return {
 			"project_id": project_id,
 			"metadata": {
@@ -195,6 +272,9 @@ def get_project_hdf_water_depth(
 	include_dry: bool = Query(default=False),
 	db: Session = Depends(get_db),
 ) -> dict[str, object]:
+	request_start = perf_counter()
+	# Receive: frontend GET /api/projects/{project_id}/hdf-water-depth with
+	# time_index/max_points/include_dry query params from assets/js/three-hdf-overlay.js.
 	project = db.get(Project, project_id)
 	if project is None:
 		raise HTTPException(status_code=404, detail="Project not found")
@@ -210,29 +290,20 @@ def get_project_hdf_water_depth(
 		"2D Flow Areas/Perimeter 1/Water Surface"
 	)
 
-	with h5py.File(hdf_path, "r") as hdf:
-		if cell_center_ref not in hdf:
-			raise HTTPException(status_code=400, detail=f"Missing HDF path: {cell_center_ref}")
-		if bed_elevation_ref not in hdf:
-			raise HTTPException(status_code=400, detail=f"Missing HDF path: {bed_elevation_ref}")
-		if water_surface_ref not in hdf:
-			raise HTTPException(status_code=400, detail=f"Missing HDF path: {water_surface_ref}")
-
-		coords = np.asarray(hdf[cell_center_ref][:], dtype=np.float64)
-		bed = np.asarray(hdf[bed_elevation_ref][:], dtype=np.float64)
-		water_surface_all = np.asarray(hdf[water_surface_ref][:], dtype=np.float64)
-
-	if coords.ndim != 2 or coords.shape[1] < 2:
-		raise HTTPException(status_code=400, detail="Invalid cell center coordinates shape")
-	if bed.ndim != 1:
-		raise HTTPException(status_code=400, detail="Invalid bed elevation shape")
-	if water_surface_all.ndim != 2:
-		raise HTTPException(status_code=400, detail="Invalid water surface shape")
-
-	cell_count = int(coords.shape[0])
-	time_step_count = int(water_surface_all.shape[0])
+	static_data = _get_hdf_static_data(
+		hdf_path=hdf_path,
+		cell_center_ref=cell_center_ref,
+		bed_elevation_ref=bed_elevation_ref,
+		water_surface_ref=water_surface_ref,
+	)
+	t_cache_ready = perf_counter()
+	coords = static_data["coords"]
+	bed = static_data["bed"]
+	cell_count = int(static_data["cell_count"])
+	time_step_count = int(static_data["time_step_count"])
 
 	if time_step_count == 0 or cell_count == 0:
+		# Send: empty timeline frame payload to frontend when no timestep or no cell exists.
 		return {
 			"project_id": project_id,
 			"time_index": -1,
@@ -255,10 +326,15 @@ def get_project_hdf_water_depth(
 			detail=f"time_index out of range: {resolved_time_index}, valid [0, {time_step_count - 1}]",
 		)
 
-	if bed.shape[0] != cell_count or water_surface_all.shape[1] != cell_count:
-		raise HTTPException(status_code=400, detail="Inconsistent HDF dataset sizes")
+	with h5py.File(hdf_path, "r") as hdf:
+		if water_surface_ref not in hdf:
+			raise HTTPException(status_code=400, detail=f"Missing HDF path: {water_surface_ref}")
+		water_surface_ds = hdf[water_surface_ref]
+		if water_surface_ds.ndim != 2 or int(water_surface_ds.shape[1]) != cell_count:
+			raise HTTPException(status_code=400, detail="Inconsistent HDF dataset sizes")
+		water_surface = np.asarray(water_surface_ds[resolved_time_index, :], dtype=np.float32)
+	t_water_surface_read = perf_counter()
 
-	water_surface = water_surface_all[resolved_time_index]
 	depth = water_surface - bed
 
 	finite_mask = (
@@ -275,8 +351,10 @@ def get_project_hdf_water_depth(
 
 	valid_indices = np.flatnonzero(valid_mask)
 	valid_count = int(valid_indices.size)
+	t_valid_filter = perf_counter()
 
 	if valid_count == 0:
+		# Send: empty point list for this frame to frontend when all cells are filtered out.
 		return {
 			"project_id": project_id,
 			"time_index": resolved_time_index,
@@ -300,6 +378,7 @@ def get_project_hdf_water_depth(
 	bed_vals = bed[sampled_indices]
 	water_surface_vals = water_surface[sampled_indices]
 	depth_vals = depth[sampled_indices]
+	t_sampling = perf_counter()
 
 	points = [
 		[
@@ -318,7 +397,25 @@ def get_project_hdf_water_depth(
 			strict=False,
 		)
 	]
+	t_points_build = perf_counter()
 
+	total_ms = (t_points_build - request_start) * 1000.0
+	cache_ms = (t_cache_ready - request_start) * 1000.0
+	water_read_ms = (t_water_surface_read - t_cache_ready) * 1000.0
+	filter_ms = (t_valid_filter - t_water_surface_read) * 1000.0
+	sampling_ms = (t_sampling - t_valid_filter) * 1000.0
+	points_ms = (t_points_build - t_sampling) * 1000.0
+	print(
+		"[perf][hdf-water-depth] "
+		f"project_id={project_id} time_index={resolved_time_index} "
+		f"valid={valid_count} sampled={len(points)} stride={stride} "
+		f"total_ms={total_ms:.2f} cache_ms={cache_ms:.2f} "
+		f"water_read_ms={water_read_ms:.2f} filter_ms={filter_ms:.2f} "
+		f"sampling_ms={sampling_ms:.2f} points_ms={points_ms:.2f}"
+	)
+
+	# Send: sampled [x, y, bed_z, water_z, depth] points and timeline metadata
+	# to frontend assets/js/three-hdf-overlay.js for visualization and slider state.
 	return {
 		"project_id": project_id,
 		"time_index": resolved_time_index,
