@@ -11,8 +11,15 @@
         { t: 1.0, color: [245, 130, 130] },
     ];
 
-    // Backend sampling target. Real returned point count is controlled by backend stride.
-    const MAX_POINTS_QUERY = 80000;
+    const TILE_TARGET_POINTS = 25000;
+    const TILE_VISIBLE_UPDATE_DEBOUNCE_MS = 40;
+    const TILE_WHEEL_END_DELAY_MS = 120;
+    const TILE_CENTER_MARKER_SIZE = 36;
+    const TILE_CENTER_MARKER_Z_OFFSET = 12;
+    const TILE_NEIGHBOR_RING = 1;
+    const TARGET_VIEW_POINTS = 50000;
+    const MAX_DYNAMIC_STRIDE = 8;
+    const TILE_FETCH_CONCURRENCY = 4;
 
     // Main canvas mount node. Abort early if template is not loaded as expected.
     const container = document.getElementById("threeRoot");
@@ -21,8 +28,30 @@
     }
 
     // Optional HUD fields in the top-right panel (load time / fps).
+    const perfHud = document.getElementById("perfHud");
     const hudLoad = document.getElementById("hudLoad");
     const hudFps = document.getElementById("hudFps");
+
+    const ensureHudLine = (id, label, defaultText) => {
+        const existing = document.getElementById(id);
+        if (existing) {
+            return existing;
+        }
+        if (!perfHud) {
+            return null;
+        }
+        const row = document.createElement("div");
+        row.innerHTML = `<span class="label">${label}</span><span id="${id}">${defaultText}</span>`;
+        perfHud.appendChild(row);
+        return document.getElementById(id);
+    };
+
+    const hudTileCount = ensureHudLine("hudTileCount", "Tiles", "--");
+    const hudTilePoints = ensureHudLine("hudTilePoints", "TilePts", "--");
+    const hudVisibleTiles = ensureHudLine("hudVisibleTiles", "Visible", "--");
+    const hudLoadedTiles = ensureHudLine("hudLoadedTiles", "Loaded", "--");
+    const hudThinFactor = ensureHudLine("hudThinFactor", "Thin", "--");
+    const hudThinPoints = ensureHudLine("hudThinPoints", "ThinPts", "--");
 
     // URL state: /three?project_id=... .
     const params = new URLSearchParams(window.location.search);
@@ -66,18 +95,40 @@
         },
 
         /**
-         * fetchTifPayload
-         * Function: Fetch sampled terrain payload for the selected project.
-         * Key variables: MAX_POINTS_QUERY and project id.
+         * fetchTifTilesMeta
+         * Function: Fetch square-tile metadata and center points for lazy loading.
          * Input: resolvedProjectId (string).
-         * Output: Promise<{vertices, points, grid, metadata, ...}>.
+         * Output: Promise<{tiles, tile_grid, metadata, ...}>.
          */
-        async fetchTifPayload(resolvedProjectId) {
+        async fetchTifTilesMeta(resolvedProjectId) {
             const response = await fetch(
-                `/api/projects/${encodeURIComponent(resolvedProjectId)}/tif-points?max_points=${MAX_POINTS_QUERY}`,
+                `/api/projects/${encodeURIComponent(resolvedProjectId)}/tif-tiles?target_points_per_tile=${TILE_TARGET_POINTS}`,
             );
             if (!response.ok) {
-                throw new Error(`Failed to load point cloud: HTTP ${response.status}`);
+                throw new Error(`Failed to load tif tile metadata: HTTP ${response.status}`);
+            }
+            return response.json();
+        },
+
+        /**
+         * fetchTifTilePayload
+         * Function: Fetch terrain points for one tile window.
+         * Input: resolvedProjectId (string), tile (tile metadata record).
+         * Output: Promise<{points, vertices, ...}>.
+         */
+        async fetchTifTilePayload(resolvedProjectId, tile, stride = 1) {
+            const query = new URLSearchParams({
+                row_start: String(tile.row_start),
+                row_end: String(tile.row_end),
+                col_start: String(tile.col_start),
+                col_end: String(tile.col_end),
+                stride: String(Math.max(1, Math.min(MAX_DYNAMIC_STRIDE, Math.trunc(stride) || 1))),
+            });
+            const response = await fetch(
+                `/api/projects/${encodeURIComponent(resolvedProjectId)}/tif-tile-points?${query.toString()}`,
+            );
+            if (!response.ok) {
+                throw new Error(`Failed to load tif tile points: HTTP ${response.status}`);
             }
             return response.json();
         },
@@ -101,6 +152,19 @@
             });
             console.log("[tif-points] vertices sample", vertices.slice(0, 5));
             console.log("[tif-points] points sample", pointsFromPayload.slice(0, 5));
+        },
+
+        logTileMetaSummary(payload) {
+            const tiles = Array.isArray(payload.tiles) ? payload.tiles : [];
+            console.log("[tif-tiles] summary", {
+                project_id: payload.project_id,
+                tile_count: payload.tile_count,
+                tile_grid: payload.tile_grid,
+                valid_point_count: payload.valid_point_count,
+                target_points_per_tile: payload.target_points_per_tile,
+                metadata: payload.metadata,
+                first_tiles: tiles.slice(0, 5),
+            });
         },
 
         /**
@@ -246,17 +310,21 @@
         /**
          * createWhitePointCloud
          * Function: Build base terrain point-cloud object.
-         * Input: positions Float32Array.
+         * Input: positions Float32Array, optional colors Float32Array.
          * Output: THREE.Points.
          */
-        createWhitePointCloud(positions) {
+        createWhitePointCloud(positions, colors = null) {
             const geometry = new THREE.BufferGeometry();
             geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+            if (colors && colors.length === positions.length) {
+                geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+            }
 
             const material = new THREE.PointsMaterial({
                 size: 0.8,
                 sizeAttenuation: true,
                 color: 0xffffff,
+                vertexColors: Boolean(colors),
                 opacity: 0.6,
                 transparent: true,
             });
@@ -276,7 +344,7 @@
          * Input: vertices, centerX/centerY (reserved), minZ, zRange.
          * Output: THREE.LineSegments or null.
          */
-        createColoredTriangleLines(vertices, centerX, centerY, minZ, zRange) {
+        createColoredTriangleLines(vertices, centerX, centerY, minZ, zRange, sampleStep = 1) {
             if (!Array.isArray(vertices) || !vertices.length) {
                 return null;
             }
@@ -313,6 +381,12 @@
                 geometryVertexColors.push(r, g, b);
             }
 
+            const rowStep = Math.max(1, Math.trunc(sampleStep) || 1);
+            const colStep = rowStep;
+            if (!Number.isFinite(rowStep) || !Number.isFinite(colStep)) {
+                return null;
+            }
+
             const triangleIndices = [];
             for (const key of keyToGeometryIndex.keys()) {
                 const parts = key.split("_");
@@ -327,9 +401,9 @@
                 }
 
                 const i00 = keyToGeometryIndex.get(`${row}_${col}`);
-                const i01 = keyToGeometryIndex.get(`${row}_${col + 1}`);
-                const i10 = keyToGeometryIndex.get(`${row + 1}_${col}`);
-                const i11 = keyToGeometryIndex.get(`${row + 1}_${col + 1}`);
+                const i01 = keyToGeometryIndex.get(`${row}_${col + colStep}`);
+                const i10 = keyToGeometryIndex.get(`${row + rowStep}_${col}`);
+                const i11 = keyToGeometryIndex.get(`${row + rowStep}_${col + colStep}`);
 
                 if (i00 == null || i01 == null || i10 == null || i11 == null) {
                     continue;
@@ -430,7 +504,7 @@
 
             this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
             this.controls.enableDamping = true;
-            this.controls.dampingFactor = 0.08;
+            this.controls.dampingFactor = 0.2;
             this.controls.screenSpacePanning = true;
 
             this.scene.add(new THREE.AxesHelper(10));
@@ -550,48 +624,491 @@
         };
 
         projectId = await DataModule.resolveProjectId(projectId, params);
-        const payload = await DataModule.fetchTifPayload(projectId);
-        DataModule.logPayloadSamples(payload);
+        const tileMeta = await DataModule.fetchTifTilesMeta(projectId);
+        DataModule.logTileMetaSummary(tileMeta);
 
-        const { points, vertices } = DataModule.normalizePoints(payload);
-        if (!points.length) {
+        const tiles = Array.isArray(tileMeta.tiles) ? tileMeta.tiles : [];
+        if (!tiles.length) {
             const elapsedMs = performance.now() - loadStartAt;
             RenderModule.setLoadHudText(`${elapsedMs.toFixed(1)} ms (empty)`);
             return;
         }
 
-        const { minZ, zRange, centerX, centerY } = DataModule.computePointStats(points);
-        const positions = DataModule.buildCenteredPositions(points, centerX, centerY);
+        const meta = tileMeta.metadata || {};
+        const zMid = Number(meta.z_mid);
+        const bboxMinX = Number(meta.bbox_minx);
+        const bboxMinY = Number(meta.bbox_miny);
+        const bboxMaxX = Number(meta.bbox_maxx);
+        const bboxMaxY = Number(meta.bbox_maxy);
 
-        const cloud = MeshModule.createWhitePointCloud(positions);
-        RenderModule.scene.add(cloud);
-
-        const triangleLines = MeshModule.createColoredTriangleLines(vertices, centerX, centerY, minZ, zRange);
-        if (triangleLines) {
-            RenderModule.scene.add(triangleLines);
+        if (
+            Number.isFinite(zMid)
+            && Number.isFinite(bboxMinX)
+            && Number.isFinite(bboxMinY)
+            && Number.isFinite(bboxMaxX)
+            && Number.isFinite(bboxMaxY)
+        ) {
+            const fitPositions = new Float32Array([
+                bboxMinX, bboxMinY, zMid,
+                bboxMinX, bboxMaxY, zMid,
+                bboxMaxX, bboxMinY, zMid,
+                bboxMaxX, bboxMaxY, zMid,
+            ]);
+            RenderModule.fitCameraToPoints(fitPositions);
         }
 
-        window.ThreeOverlayBridge = {
-            scene: RenderModule.scene,
-            camera: RenderModule.camera,
-            renderer: RenderModule.renderer,
-            controls: RenderModule.controls,
-            ready: true,
-            centerX: 0,
-            centerY: 0,
-            minZ,
-            maxZ: minZ + zRange,
-            zRange,
-        };
-        window.dispatchEvent(
-            new CustomEvent("three-base-ready", {
-                detail: window.ThreeOverlayBridge,
-            }),
-        );
+        const tileCache = new Map();
+        const tileMarkerMap = new Map();
+        let tileMarkerGroup = null;
+        let cloud = null;
+        let triangleLines = null;
+        let firstRenderable = true;
+        let refreshSeq = 0;
+        let refreshTimer = null;
+        let controlsInteracting = false;
+        let lastInteractionType = "unknown";
 
-        RenderModule.fitCameraToPoints(positions);
-        const elapsedMs = performance.now() - loadStartAt;
-        RenderModule.setLoadHudText(`${elapsedMs.toFixed(1)} ms`);
+        const tileKey = (tile) => `${tile.row_start}:${tile.row_end}:${tile.col_start}:${tile.col_end}`;
+        const tileRcKey = (tileRow, tileCol) => `${tileRow}:${tileCol}`;
+        const tileGridRows = Number(tileMeta.tile_grid?.rows) || 0;
+        const tileGridCols = Number(tileMeta.tile_grid?.cols) || 0;
+        const tileByRc = new Map();
+        for (let i = 0; i < tiles.length; i += 1) {
+            const tile = tiles[i];
+            tileByRc.set(tileRcKey(Number(tile.tile_row), Number(tile.tile_col)), tile);
+        }
+
+        const expandTilesWithNeighborRing = (seedTiles) => {
+            if (!Array.isArray(seedTiles) || seedTiles.length === 0) {
+                return [];
+            }
+            const expanded = [];
+            const seen = new Set();
+
+            for (let i = 0; i < seedTiles.length; i += 1) {
+                const seed = seedTiles[i];
+                const seedRow = Number(seed.tile_row);
+                const seedCol = Number(seed.tile_col);
+                if (!Number.isFinite(seedRow) || !Number.isFinite(seedCol)) {
+                    continue;
+                }
+
+                for (let dr = -TILE_NEIGHBOR_RING; dr <= TILE_NEIGHBOR_RING; dr += 1) {
+                    for (let dc = -TILE_NEIGHBOR_RING; dc <= TILE_NEIGHBOR_RING; dc += 1) {
+                        const nr = seedRow + dr;
+                        const nc = seedCol + dc;
+                        if (nr < 0 || nr >= tileGridRows || nc < 0 || nc >= tileGridCols) {
+                            continue;
+                        }
+                        const neighbor = tileByRc.get(tileRcKey(nr, nc));
+                        if (!neighbor) {
+                            continue;
+                        }
+                        const key = tileKey(neighbor);
+                        if (seen.has(key)) {
+                            continue;
+                        }
+                        seen.add(key);
+                        expanded.push(neighbor);
+                    }
+                }
+            }
+
+            return expanded;
+        };
+
+        const formatTileList = (tileList, maxLen = 12) => {
+            if (!Array.isArray(tileList) || tileList.length === 0) {
+                return "none";
+            }
+            const values = tileList
+                .slice(0, maxLen)
+                .map((tile) => `r${tile.tile_row}c${tile.tile_col}`);
+            if (tileList.length > maxLen) {
+                values.push(`+${tileList.length - maxLen}`);
+            }
+            return values.join(",");
+        };
+
+        const updateTileHud = (visibleTiles, dynamicStride, renderedPointCount, visiblePointEstimate) => {
+            const tileCount = Number(tileMeta.tile_count) || tiles.length;
+            const validTotal = Number(tileMeta.valid_point_count) || 0;
+            const targetPerTile = Number(tileMeta.target_points_per_tile) || TILE_TARGET_POINTS;
+            const approxPerTile = tileCount > 0 ? Math.round(validTotal / tileCount) : 0;
+            const loadedTiles = tiles.filter((tile) => tileCache.has(tileKey(tile)));
+
+            if (hudTileCount) {
+                hudTileCount.textContent = `${tileCount} (${tileMeta.tile_grid?.rows || 0}x${tileMeta.tile_grid?.cols || 0})`;
+            }
+            if (hudTilePoints) {
+                hudTilePoints.textContent = `target ${targetPerTile}, avg ${approxPerTile}`;
+            }
+            if (hudVisibleTiles) {
+                hudVisibleTiles.textContent = `${visibleTiles.length}: ${formatTileList(visibleTiles)}`;
+            }
+            if (hudLoadedTiles) {
+                hudLoadedTiles.textContent = `${loadedTiles.length}: ${formatTileList(loadedTiles)}`;
+            }
+            if (hudThinFactor) {
+                hudThinFactor.textContent = `i=${dynamicStride} (raw ${visiblePointEstimate})`;
+            }
+            if (hudThinPoints) {
+                hudThinPoints.textContent = String(renderedPointCount);
+            }
+        };
+
+        const updateTileMarkerStates = (visibleTiles) => {
+            const visibleKeys = new Set(visibleTiles.map((tile) => tileKey(tile)));
+            for (let i = 0; i < tiles.length; i += 1) {
+                const tile = tiles[i];
+                const key = tileKey(tile);
+                const marker = tileMarkerMap.get(key);
+                if (!marker) {
+                    continue;
+                }
+                const isVisible = visibleKeys.has(key);
+                const isLoaded = tileCache.has(key);
+                const lineColor = isVisible ? 0xffd84d : (isLoaded ? 0xff4fd8 : 0x31c7f6);
+                const dotColor = isVisible ? 0xffa300 : (isLoaded ? 0xff00d9 : 0x00d4ff);
+                marker.line.material.color.setHex(lineColor);
+                marker.dot.material.color.setHex(dotColor);
+                marker.dot.material.opacity = isVisible ? 1.0 : (isLoaded ? 0.9 : 0.55);
+            }
+        };
+
+        const createTileCenterMarkers = () => {
+            if (tileMarkerGroup) {
+                RenderModule.scene.remove(tileMarkerGroup);
+                tileMarkerMap.clear();
+            }
+            tileMarkerGroup = new THREE.Group();
+            tileMarkerGroup.name = "tifTileCenters";
+
+            const markerZ = (Number.isFinite(zMid) ? zMid : 0) + TILE_CENTER_MARKER_Z_OFFSET;
+            for (let i = 0; i < tiles.length; i += 1) {
+                const tile = tiles[i];
+                const cx = Number(tile.center_x);
+                const cy = Number(tile.center_y);
+                if (!Number.isFinite(cx) || !Number.isFinite(cy)) {
+                    continue;
+                }
+
+                const crossGeometry = new THREE.BufferGeometry();
+                const half = TILE_CENTER_MARKER_SIZE * 0.5;
+                const crossPositions = new Float32Array([
+                    cx - half, cy, markerZ,
+                    cx + half, cy, markerZ,
+                    cx, cy - half, markerZ,
+                    cx, cy + half, markerZ,
+                ]);
+                crossGeometry.setAttribute("position", new THREE.BufferAttribute(crossPositions, 3));
+                const crossMaterial = new THREE.LineBasicMaterial({
+                    color: 0x31c7f6,
+                    transparent: true,
+                    opacity: 0.9,
+                    depthTest: false,
+                });
+                const cross = new THREE.LineSegments(crossGeometry, crossMaterial);
+                cross.renderOrder = 1200;
+
+                const dot = new THREE.Mesh(
+                    new THREE.SphereGeometry(Math.max(2, TILE_CENTER_MARKER_SIZE * 0.08), 10, 10),
+                    new THREE.MeshBasicMaterial({
+                        color: 0x00d4ff,
+                        transparent: true,
+                        opacity: 0.6,
+                        depthTest: false,
+                    }),
+                );
+                dot.position.set(cx, cy, markerZ + 0.5);
+                dot.renderOrder = 1201;
+
+                tileMarkerGroup.add(cross);
+                tileMarkerGroup.add(dot);
+                tileMarkerMap.set(tileKey(tile), { line: cross, dot });
+            }
+
+            RenderModule.scene.add(tileMarkerGroup);
+        };
+
+        const createFrustum = () => {
+            RenderModule.camera.updateMatrixWorld();
+            const matrix = new THREE.Matrix4().multiplyMatrices(
+                RenderModule.camera.projectionMatrix,
+                RenderModule.camera.matrixWorldInverse,
+            );
+            const frustum = new THREE.Frustum();
+            frustum.setFromProjectionMatrix(matrix);
+            return frustum;
+        };
+
+        const collectVisibleTiles = () => {
+            const frustum = createFrustum();
+            const centerZ = Number.isFinite(zMid) ? zMid : 0;
+            const visibleSeeds = [];
+            const target = RenderModule.controls.target;
+
+            for (let i = 0; i < tiles.length; i += 1) {
+                const tile = tiles[i];
+                const cx = Number(tile.center_x);
+                const cy = Number(tile.center_y);
+                if (!Number.isFinite(cx) || !Number.isFinite(cy)) {
+                    continue;
+                }
+                if (frustum.containsPoint(new THREE.Vector3(cx, cy, centerZ))) {
+                    const dx = cx - target.x;
+                    const dy = cy - target.y;
+                    visibleSeeds.push({ tile, dist2: dx * dx + dy * dy });
+                }
+            }
+
+            if (visibleSeeds.length > 0) {
+                visibleSeeds.sort((a, b) => a.dist2 - b.dist2);
+                const seedTiles = visibleSeeds.map((entry) => entry.tile);
+                return expandTilesWithNeighborRing(seedTiles);
+            }
+
+            // Fallback: when no center is inside current frustum, load the nearest tile.
+            let nearest = null;
+            let nearestDist = Number.POSITIVE_INFINITY;
+            for (let i = 0; i < tiles.length; i += 1) {
+                const tile = tiles[i];
+                const cx = Number(tile.center_x);
+                const cy = Number(tile.center_y);
+                if (!Number.isFinite(cx) || !Number.isFinite(cy)) {
+                    continue;
+                }
+                const dx = cx - target.x;
+                const dy = cy - target.y;
+                const dist = dx * dx + dy * dy;
+                if (dist < nearestDist) {
+                    nearestDist = dist;
+                    nearest = tile;
+                }
+            }
+            return nearest ? expandTilesWithNeighborRing([nearest]) : [];
+        };
+
+        const rebuildSceneFromVisibleTiles = (visibleTiles, sampleStep) => {
+            const uniqueVertexByKey = new Map();
+
+            for (let i = 0; i < visibleTiles.length; i += 1) {
+                const cached = tileCache.get(tileKey(visibleTiles[i]));
+                if (!cached) {
+                    continue;
+                }
+                const payloadVertices = Array.isArray(cached.vertices) ? cached.vertices : [];
+                for (let v = 0; v < payloadVertices.length; v += 1) {
+                    const vertex = payloadVertices[v];
+                    if (!vertex || !vertex.valid) {
+                        continue;
+                    }
+                    const row = Number(vertex.sample_row);
+                    const col = Number(vertex.sample_col);
+                    const x = Number(vertex.x);
+                    const y = Number(vertex.y);
+                    const z = Number(vertex.elevation);
+                    if (!Number.isFinite(row) || !Number.isFinite(col) || !Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+                        continue;
+                    }
+                    const key = `${row}_${col}`;
+                    if (!uniqueVertexByKey.has(key)) {
+                        uniqueVertexByKey.set(key, vertex);
+                    }
+                }
+            }
+
+            const mergedVertices = Array.from(uniqueVertexByKey.values());
+            const mergedPoints = mergedVertices.map((vertex) => [Number(vertex.x), Number(vertex.y), Number(vertex.elevation)]);
+
+            if (!mergedPoints.length) {
+                return 0;
+            }
+
+            const { minZ, zRange, centerX, centerY } = DataModule.computePointStats(mergedPoints);
+            const positions = DataModule.buildCenteredPositions(mergedPoints, centerX, centerY);
+            const colors = new Float32Array(mergedPoints.length * 3);
+            for (let i = 0; i < mergedPoints.length; i += 1) {
+                const z = Number(mergedPoints[i][2]);
+                const t = THREE.MathUtils.clamp((z - minZ) / Math.max(zRange, 1e-9), 0, 1);
+                const [r, g, b] = MeshModule.sampleElevationRamp(t);
+                colors[i * 3] = r;
+                colors[i * 3 + 1] = g;
+                colors[i * 3 + 2] = b;
+            }
+
+            if (cloud) {
+                cloud.geometry.dispose();
+                cloud.material.dispose();
+                RenderModule.scene.remove(cloud);
+                cloud = null;
+            }
+            cloud = MeshModule.createWhitePointCloud(positions, colors);
+            RenderModule.scene.add(cloud);
+
+            if (triangleLines) {
+                triangleLines.geometry.dispose();
+                triangleLines.material.dispose();
+                RenderModule.scene.remove(triangleLines);
+                triangleLines = null;
+            }
+
+            triangleLines = MeshModule.createColoredTriangleLines(mergedVertices, centerX, centerY, minZ, zRange, sampleStep);
+            if (triangleLines) {
+                RenderModule.scene.add(triangleLines);
+            }
+
+            window.ThreeOverlayBridge = {
+                scene: RenderModule.scene,
+                camera: RenderModule.camera,
+                renderer: RenderModule.renderer,
+                controls: RenderModule.controls,
+                ready: true,
+                centerX: 0,
+                centerY: 0,
+                minZ,
+                maxZ: minZ + zRange,
+                zRange,
+            };
+
+            if (firstRenderable) {
+                window.dispatchEvent(
+                    new CustomEvent("three-base-ready", {
+                        detail: window.ThreeOverlayBridge,
+                    }),
+                );
+                firstRenderable = false;
+            }
+
+            const elapsedMs = performance.now() - loadStartAt;
+            RenderModule.setLoadHudText(`${elapsedMs.toFixed(1)} ms | tiles ${visibleTiles.length}`);
+            return mergedPoints.length;
+        };
+
+        const runWithConcurrency = async (taskFactories, limit) => {
+            const safeLimit = Math.max(1, Math.trunc(limit) || 1);
+            let cursor = 0;
+
+            const worker = async () => {
+                while (cursor < taskFactories.length) {
+                    const index = cursor;
+                    cursor += 1;
+                    await taskFactories[index]();
+                }
+            };
+
+            const workers = [];
+            for (let i = 0; i < Math.min(safeLimit, taskFactories.length); i += 1) {
+                workers.push(worker());
+            }
+            await Promise.all(workers);
+        };
+
+        const updateVisibleTiles = async (options = {}) => {
+            const skipRebuild = Boolean(options.skipRebuild);
+            const requestId = refreshSeq + 1;
+            refreshSeq = requestId;
+
+            const visibleTiles = collectVisibleTiles();
+            const visiblePointEstimate = visibleTiles.reduce((acc, tile) => acc + (Number(tile.point_count) || 0), 0);
+            const dynamicStride = Math.max(
+                1,
+                Math.min(MAX_DYNAMIC_STRIDE, Math.ceil(Math.max(visiblePointEstimate, 1) / TARGET_VIEW_POINTS)),
+            );
+            const taskFactories = [];
+            for (let i = 0; i < visibleTiles.length; i += 1) {
+                const tile = visibleTiles[i];
+                const key = tileKey(tile);
+                const cached = tileCache.get(key);
+                if (cached && Number(cached._stride || 1) === dynamicStride) {
+                    continue;
+                }
+                taskFactories.push(async () => {
+                    const payload = await DataModule.fetchTifTilePayload(projectId, tile, dynamicStride);
+                        payload._stride = dynamicStride;
+                        tileCache.set(key, payload);
+                });
+            }
+
+            if (taskFactories.length) {
+                await runWithConcurrency(taskFactories, TILE_FETCH_CONCURRENCY);
+            }
+
+            if (requestId !== refreshSeq) {
+                return;
+            }
+
+            let renderedPointCount = 0;
+            if (skipRebuild) {
+                for (let i = 0; i < visibleTiles.length; i += 1) {
+                    const cached = tileCache.get(tileKey(visibleTiles[i]));
+                    if (!cached || !Array.isArray(cached.points)) {
+                        continue;
+                    }
+                    renderedPointCount += cached.points.length;
+                }
+            } else {
+                renderedPointCount = rebuildSceneFromVisibleTiles(visibleTiles, dynamicStride);
+            }
+            updateTileMarkerStates(visibleTiles);
+            updateTileHud(visibleTiles, dynamicStride, renderedPointCount, visiblePointEstimate);
+        };
+
+        createTileCenterMarkers();
+
+        await updateVisibleTiles();
+
+        const scheduleRefresh = (delayMs) => {
+            if (refreshTimer) {
+                window.clearTimeout(refreshTimer);
+            }
+            refreshTimer = window.setTimeout(() => {
+                refreshTimer = null;
+                void updateVisibleTiles();
+            }, delayMs);
+        };
+
+        RenderModule.renderer.domElement.addEventListener("wheel", () => {
+            lastInteractionType = "wheel";
+        }, { passive: true });
+
+        RenderModule.renderer.domElement.addEventListener("pointerdown", (event) => {
+            if (event.button === 0) {
+                lastInteractionType = "rotate";
+            } else if (event.button === 2) {
+                lastInteractionType = "pan";
+            } else {
+                lastInteractionType = "pointer";
+            }
+        });
+
+        RenderModule.controls.addEventListener("start", () => {
+            controlsInteracting = true;
+            if (refreshTimer) {
+                window.clearTimeout(refreshTimer);
+                refreshTimer = null;
+            }
+        });
+
+        RenderModule.controls.addEventListener("change", () => {
+            // Avoid heavy refresh while user is actively dragging/zooming.
+            if (controlsInteracting) {
+                // During interaction we only update lightweight tile state, no geometry rebuild.
+                void updateVisibleTiles({ skipRebuild: true });
+                return;
+            }
+            scheduleRefresh(TILE_VISIBLE_UPDATE_DEBOUNCE_MS);
+        });
+
+        RenderModule.controls.addEventListener("end", () => {
+            controlsInteracting = false;
+            if (lastInteractionType === "wheel") {
+                // Wheel emits dense events; delay refresh slightly to avoid per-notch stalls.
+                scheduleRefresh(TILE_WHEEL_END_DELAY_MS);
+                return;
+            }
+            void updateVisibleTiles();
+        });
     }
 
     // Keep UI responsive even if bootstrap fails.

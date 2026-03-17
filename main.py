@@ -13,6 +13,7 @@ from fastapi.templating import Jinja2Templates
 import h5py
 import rasterio
 import numpy as np
+from rasterio.windows import Window
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -87,6 +88,31 @@ def _get_hdf_static_data(
 		_HDF_STATIC_CACHE[cache_key] = static_data
 
 	return static_data
+
+
+def _build_square_tile_bounds(
+	*,
+	width: int,
+	height: int,
+	valid_count: int,
+	target_points_per_tile: int,
+) -> tuple[int, list[tuple[int, int, int, int]]]:
+	"""Build N x N square tile bounds by valid point count target."""
+	target = max(10_000, min(99_999, int(target_points_per_tile)))
+	tile_axis_count = max(1, int(np.ceil(np.sqrt(max(valid_count, 1) / target))))
+	tile_width = int(np.ceil(width / tile_axis_count))
+	tile_height = int(np.ceil(height / tile_axis_count))
+	bounds: list[tuple[int, int, int, int]] = []
+	for tile_row in range(tile_axis_count):
+		row_start = tile_row * tile_height
+		row_end = min(height, row_start + tile_height)
+		for tile_col in range(tile_axis_count):
+			col_start = tile_col * tile_width
+			col_end = min(width, col_start + tile_width)
+			if row_start >= row_end or col_start >= col_end:
+				continue
+			bounds.append((row_start, row_end, col_start, col_end))
+	return tile_axis_count, bounds
 
 app = FastAPI(title="HEC-RAS 3D Project Manager")
 app.mount("/assets", StaticFiles(directory=BASE_DIR / "assets"), name="assets")
@@ -196,7 +222,15 @@ def get_project_tif_points(
 				"points": [],
 			}
 
-		stride = max(1, int(np.ceil(np.sqrt(valid_count / max_points))))
+		# Safety guard: full-resolution point return is fine for small projects
+		# (e.g. shuiku), but will freeze/oom on very large rasters (e.g. changjiang).
+		# Keep no-downsampling behavior for small datasets; fall back to adaptive stride
+		# when valid cells are too many.
+		FULL_RES_VALID_CELL_LIMIT = 300_000
+		if valid_count <= FULL_RES_VALID_CELL_LIMIT:
+			stride = 1
+		else:
+			stride = max(1, int(np.ceil(np.sqrt(valid_count / max_points))))
 		sampled_rows = np.arange(0, src.height, stride, dtype=np.int32)
 		sampled_cols = np.arange(0, src.width, stride, dtype=np.int32)
 
@@ -255,6 +289,230 @@ def get_project_tif_points(
 			},
 			"point_count": len(points),
 			"stride": stride,
+			"grid": {
+				"rows": int(sampled_rows.size),
+				"cols": int(sampled_cols.size),
+			},
+			"vertices": vertices,
+			"points": points,
+		}
+
+
+@app.get("/api/projects/{project_id}/tif-tiles")
+def get_project_tif_tiles(
+	project_id: int,
+	target_points_per_tile: int = Query(default=25000, ge=10000, le=99999),
+	db: Session = Depends(get_db),
+) -> dict[str, object]:
+	"""Return uniformly split square tile metadata and tile centers for lazy loading."""
+	project = db.get(Project, project_id)
+	if project is None:
+		raise HTTPException(status_code=404, detail="Project not found")
+
+	tif_path = (BASE_DIR / project.tif_path).resolve()
+	if not tif_path.exists():
+		raise HTTPException(status_code=404, detail="TIF file not found")
+
+	with rasterio.open(tif_path) as src:
+		band = src.read(1, masked=True)
+		valid_mask = ~np.ma.getmaskarray(band)
+		valid_count = int(valid_mask.sum())
+		z_values = np.asarray(np.ma.filled(band.astype(np.float64), np.nan), dtype=np.float64)
+		z_min = float(np.nanmin(z_values)) if np.isfinite(np.nanmin(z_values)) else 0.0
+		z_max = float(np.nanmax(z_values)) if np.isfinite(np.nanmax(z_values)) else 0.0
+
+		if valid_count == 0:
+			return {
+				"project_id": project_id,
+				"target_points_per_tile": int(target_points_per_tile),
+				"tile_grid": {"rows": 0, "cols": 0},
+				"tile_count": 0,
+				"valid_point_count": 0,
+				"metadata": {
+					"source": str(project.tif_path),
+					"crs": src.crs.to_string() if src.crs else "UNKNOWN",
+					"width": int(src.width),
+					"height": int(src.height),
+					"nodata": src.nodata,
+					"bbox_minx": float(src.bounds.left),
+					"bbox_miny": float(src.bounds.bottom),
+					"bbox_maxx": float(src.bounds.right),
+					"bbox_maxy": float(src.bounds.top),
+					"z_min": z_min,
+					"z_max": z_max,
+					"z_mid": float((z_min + z_max) * 0.5),
+				},
+				"tiles": [],
+			}
+
+		tile_axis_count, tile_bounds = _build_square_tile_bounds(
+			width=int(src.width),
+			height=int(src.height),
+			valid_count=valid_count,
+			target_points_per_tile=int(target_points_per_tile),
+		)
+
+		integral = np.cumsum(np.cumsum(valid_mask.astype(np.int32), axis=0), axis=1)
+
+		def rect_sum(row_start: int, row_end: int, col_start: int, col_end: int) -> int:
+			total = int(integral[row_end - 1, col_end - 1])
+			if row_start > 0:
+				total -= int(integral[row_start - 1, col_end - 1])
+			if col_start > 0:
+				total -= int(integral[row_end - 1, col_start - 1])
+			if row_start > 0 and col_start > 0:
+				total += int(integral[row_start - 1, col_start - 1])
+			return total
+
+		tiles: list[dict[str, object]] = []
+		for tile_index, (row_start, row_end, col_start, col_end) in enumerate(tile_bounds):
+			center_row = (row_start + row_end - 1) * 0.5
+			center_col = (col_start + col_end - 1) * 0.5
+			center_x, center_y = src.transform * (center_col + 0.5, center_row + 0.5)
+			tiles.append(
+				{
+					"tile_id": tile_index,
+					"tile_row": int(tile_index // tile_axis_count),
+					"tile_col": int(tile_index % tile_axis_count),
+					"row_start": int(row_start),
+					"row_end": int(row_end),
+					"col_start": int(col_start),
+					"col_end": int(col_end),
+					"center_x": float(center_x),
+					"center_y": float(center_y),
+					"point_count": int(rect_sum(row_start, row_end, col_start, col_end)),
+				}
+			)
+
+		return {
+			"project_id": project_id,
+			"target_points_per_tile": int(target_points_per_tile),
+			"tile_grid": {"rows": tile_axis_count, "cols": tile_axis_count},
+			"tile_count": len(tiles),
+			"valid_point_count": valid_count,
+			"metadata": {
+				"source": str(project.tif_path),
+				"crs": src.crs.to_string() if src.crs else "UNKNOWN",
+				"width": int(src.width),
+				"height": int(src.height),
+				"nodata": src.nodata,
+				"bbox_minx": float(src.bounds.left),
+				"bbox_miny": float(src.bounds.bottom),
+				"bbox_maxx": float(src.bounds.right),
+				"bbox_maxy": float(src.bounds.top),
+				"z_min": z_min,
+				"z_max": z_max,
+				"z_mid": float((z_min + z_max) * 0.5),
+			},
+			"tiles": tiles,
+		}
+
+
+@app.get("/api/projects/{project_id}/tif-tile-points")
+def get_project_tif_tile_points(
+	project_id: int,
+	row_start: int = Query(ge=0),
+	row_end: int = Query(ge=1),
+	col_start: int = Query(ge=0),
+	col_end: int = Query(ge=1),
+	stride: int = Query(default=1, ge=1, le=32),
+	db: Session = Depends(get_db),
+) -> dict[str, object]:
+	"""Return points/vertices for one precomputed tile window."""
+	project = db.get(Project, project_id)
+	if project is None:
+		raise HTTPException(status_code=404, detail="Project not found")
+
+	tif_path = (BASE_DIR / project.tif_path).resolve()
+	if not tif_path.exists():
+		raise HTTPException(status_code=404, detail="TIF file not found")
+
+	with rasterio.open(tif_path) as src:
+		if row_start >= row_end or col_start >= col_end:
+			raise HTTPException(status_code=400, detail="Invalid tile window")
+		if row_end > src.height or col_end > src.width:
+			raise HTTPException(status_code=400, detail="Tile window out of raster bounds")
+
+		window = Window(col_start, row_start, col_end - col_start, row_end - row_start)
+		band = src.read(1, masked=True, window=window)
+		valid_mask = ~np.ma.getmaskarray(band)
+
+		# Align tile sampling to a global stride phase so adjacent tiles use
+		# consistent row/col lattices and can be connected across tile seams.
+		first_row = row_start + ((-row_start) % stride)
+		first_col = col_start + ((-col_start) % stride)
+		if first_row >= row_end:
+			first_row = row_start
+		if first_col >= col_end:
+			first_col = col_start
+
+		sampled_rows = np.arange(first_row, row_end, stride, dtype=np.int32)
+		sampled_cols = np.arange(first_col, col_end, stride, dtype=np.int32)
+		if sampled_rows.size == 0 or sampled_cols.size == 0:
+			return {
+				"project_id": project_id,
+				"point_count": 0,
+				"stride": int(stride),
+				"window": {
+					"row_start": int(row_start),
+					"row_end": int(row_end),
+					"col_start": int(col_start),
+					"col_end": int(col_end),
+				},
+				"grid": {"rows": 0, "cols": 0},
+				"vertices": [],
+				"points": [],
+			}
+
+		grid_rows, grid_cols = np.meshgrid(sampled_rows, sampled_cols, indexing="ij")
+		rows = grid_rows.ravel()
+		cols = grid_cols.ravel()
+
+		local_rows = rows - row_start
+		local_cols = cols - col_start
+		valid_flat = valid_mask[local_rows, local_cols]
+		sampled_band = band[local_rows, local_cols].astype(np.float64)
+		z_values = np.asarray(np.ma.filled(sampled_band, np.nan), dtype=np.float64)
+		x_vals, y_vals = rasterio.transform.xy(src.transform, rows, cols, offset="center")
+
+		vertices = [
+			{
+				"sample_row": int(row),
+				"sample_col": int(col),
+				"row": int(row),
+				"col": int(col),
+				"x": float(x),
+				"y": float(y),
+				"elevation": float(z) if bool(valid) else None,
+				"valid": bool(valid),
+			}
+			for row, col, x, y, z, valid in zip(
+				rows,
+				cols,
+				x_vals,
+				y_vals,
+				z_values,
+				valid_flat,
+				strict=False,
+			)
+		]
+
+		points = [
+			[float(x), float(y), float(z)]
+			for x, y, z, valid in zip(x_vals, y_vals, z_values, valid_flat, strict=False)
+			if bool(valid)
+		]
+
+		return {
+			"project_id": project_id,
+			"point_count": len(points),
+			"stride": int(stride),
+			"window": {
+				"row_start": int(row_start),
+				"row_end": int(row_end),
+				"col_start": int(col_start),
+				"col_end": int(col_end),
+			},
 			"grid": {
 				"rows": int(sampled_rows.size),
 				"cols": int(sampled_cols.size),
