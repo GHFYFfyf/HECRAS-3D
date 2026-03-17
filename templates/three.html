@@ -3,14 +3,30 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Three.js Empty Scene</title>
+    <title>HEC-RAS 3D 场景</title>
     <style>
+        @import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap");
+
+        :root {
+            --ui-bg: rgba(8, 13, 24, 0.76);
+            --ui-border: rgba(145, 176, 255, 0.28);
+            --ui-text: #f2f6ff;
+            --ui-muted: #9aafde;
+            --ui-accent: #8ddcff;
+            --ui-accent-soft: rgba(141, 220, 255, 0.18);
+        }
+
         html, body {
             margin: 0;
             width: 100%;
             height: 100%;
             overflow: hidden;
-            background: #05070d;
+            background:
+                radial-gradient(circle at 18% 16%, rgba(75, 132, 255, 0.22) 0%, rgba(75, 132, 255, 0) 42%),
+                radial-gradient(circle at 84% 22%, rgba(86, 197, 255, 0.2) 0%, rgba(86, 197, 255, 0) 38%),
+                linear-gradient(180deg, #030712 0%, #020409 100%);
+            font-family: "Space Grotesk", "Segoe UI", sans-serif;
+            color: var(--ui-text);
         }
 
         #threeRoot {
@@ -18,30 +34,229 @@
             height: 100vh;
         }
 
+        .scene-ui {
+            position: fixed;
+            inset: 0;
+            z-index: 30;
+            pointer-events: none;
+        }
+
+        .scene-topbar {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            right: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        .brand-card {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 14px;
+            border-radius: 12px;
+            border: 1px solid var(--ui-border);
+            background: var(--ui-bg);
+            backdrop-filter: blur(16px);
+            box-shadow: 0 12px 36px rgba(0, 0, 0, 0.35);
+        }
+
+        .brand-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 999px;
+            background: var(--ui-accent);
+            box-shadow: 0 0 14px rgba(141, 220, 255, 0.7);
+        }
+
+        .brand-text {
+            display: flex;
+            flex-direction: column;
+            gap: 1px;
+        }
+
+        .brand-text strong {
+            font-size: 14px;
+            letter-spacing: 0.03em;
+            font-weight: 700;
+        }
+
+        .brand-text span {
+            font-size: 11px;
+            color: var(--ui-muted);
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .project-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 12px;
+            border-radius: 999px;
+            border: 1px solid var(--ui-border);
+            background: rgba(7, 12, 22, 0.78);
+            color: #d6e5ff;
+            font-size: 12px;
+            letter-spacing: 0.04em;
+            backdrop-filter: blur(10px);
+        }
+
+        .scene-side {
+            position: absolute;
+            left: 16px;
+            bottom: 16px;
+            width: min(300px, calc(100vw - 32px));
+            border-radius: 14px;
+            border: 1px solid var(--ui-border);
+            background: var(--ui-bg);
+            backdrop-filter: blur(14px);
+            box-shadow: 0 18px 42px rgba(0, 0, 0, 0.38);
+            overflow: hidden;
+        }
+
+        .scene-side__head {
+            padding: 12px 14px 10px;
+            border-bottom: 1px solid rgba(145, 176, 255, 0.2);
+            font-size: 12px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--ui-muted);
+        }
+
+        .scene-side__body {
+            padding: 12px 14px;
+            display: grid;
+            gap: 10px;
+            font-size: 12px;
+            color: #dbe7ff;
+            line-height: 1.6;
+        }
+
+        .scene-side__row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .scene-side__row span {
+            color: var(--ui-muted);
+            letter-spacing: 0.04em;
+        }
+
+        .scene-side__row strong {
+            font-weight: 600;
+            color: #eef5ff;
+        }
+
         #perfHud {
             position: fixed;
-            top: 12px;
-            right: 12px;
-            min-width: 140px;
-            padding: 8px 10px;
-            border-radius: 8px;
-            background: rgba(7, 10, 18, 0.78);
-            border: 1px solid rgba(255, 255, 255, 0.16);
-            color: #dbe5ff;
-            font: 12px/1.5 "Menlo", "Consolas", monospace;
-            letter-spacing: 0.2px;
+            top: 16px;
+            right: 16px;
+            min-width: 170px;
+            padding: 12px 14px;
+            border-radius: 12px;
+            background: var(--ui-bg);
+            border: 1px solid var(--ui-border);
+            color: #e3edff;
+            font: 12px/1.55 "Space Grotesk", "Menlo", monospace;
+            letter-spacing: 0.25px;
             pointer-events: none;
             z-index: 20;
+            backdrop-filter: blur(16px);
+            box-shadow: 0 16px 38px rgba(0, 0, 0, 0.36);
         }
 
         #perfHud .label {
-            color: #95a4cc;
+            color: var(--ui-muted);
             margin-right: 6px;
+        }
+
+        #hdfTimelineRoot {
+            top: auto !important;
+            left: 50% !important;
+            right: auto !important;
+            bottom: 16px !important;
+            transform: translateX(-50%) !important;
+            width: min(720px, calc(100vw - 350px)) !important;
+            max-width: calc(100vw - 32px) !important;
+            padding: 12px 14px !important;
+            border-radius: 14px !important;
+            background: var(--ui-bg) !important;
+            border: 1px solid var(--ui-border) !important;
+            color: #e0ebff !important;
+            font: 12px/1.5 "Space Grotesk", "Menlo", monospace !important;
+            backdrop-filter: blur(16px);
+            box-shadow: 0 18px 44px rgba(0, 0, 0, 0.38);
+        }
+
+        #hdfTimelineRoot input[type="range"] {
+            accent-color: #9dd8ff;
+        }
+
+        @media (max-width: 1024px) {
+            #hdfTimelineRoot {
+                width: min(720px, calc(100vw - 32px)) !important;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .scene-topbar {
+                flex-wrap: wrap;
+            }
+
+            #perfHud {
+                top: auto;
+                right: 12px;
+                bottom: 164px;
+                min-width: 150px;
+                padding: 10px 12px;
+            }
+
+            .scene-side {
+                width: calc(100vw - 24px);
+                left: 12px;
+                right: 12px;
+                bottom: 84px;
+            }
+
+            #hdfTimelineRoot {
+                bottom: 12px !important;
+                width: calc(100vw - 24px) !important;
+                padding: 10px 12px !important;
+            }
         }
     </style>
 </head>
 <body>
     <div id="threeRoot"></div>
+    <div class="scene-ui">
+        <div class="scene-topbar">
+            <div class="brand-card">
+                <span class="brand-dot" aria-hidden="true"></span>
+                <div class="brand-text">
+                    <strong>HEC-RAS 3D</strong>
+                    <span>Project Viewport</span>
+                </div>
+            </div>
+            <div class="project-chip" id="projectChip">项目 ID: --</div>
+        </div>
+
+        <aside class="scene-side" aria-label="场景信息">
+            <div class="scene-side__head">导航提示</div>
+            <div class="scene-side__body">
+                <div class="scene-side__row"><span>旋转视角</span><strong>左键拖拽</strong></div>
+                <div class="scene-side__row"><span>平移视角</span><strong>右键拖拽</strong></div>
+                <div class="scene-side__row"><span>缩放</span><strong>滚轮</strong></div>
+                <div class="scene-side__row"><span>渲染模式</span><strong>AUTO / SURFACE / POINTS</strong></div>
+            </div>
+        </aside>
+    </div>
+
     <div id="perfHud">
         <div><span class="label">Load</span><span id="hudLoad">-- ms</span></div>
         <div><span class="label">FPS</span><span id="hudFps">--</span></div>
@@ -55,5 +270,16 @@
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
     <script src="/assets/js/three-empty.js?v=20260317-tiledebug"></script>
     <script src="/assets/js/three-hdf-overlay.js?v=20260317-tiledebug"></script>
+    <script>
+        (function () {
+            const params = new URLSearchParams(window.location.search);
+            const chip = document.getElementById("projectChip");
+            if (!chip) {
+                return;
+            }
+            const projectId = params.get("project_id") || "--";
+            chip.textContent = `项目 ID: ${projectId}`;
+        })();
+    </script>
 </body>
 </html>
