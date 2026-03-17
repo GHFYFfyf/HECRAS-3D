@@ -11,15 +11,15 @@
         { t: 1.0, color: [245, 130, 130] },
     ];
 
-    const TILE_TARGET_POINTS = 25000;
+    const TILE_TARGET_POINTS = 18000;
     const TILE_VISIBLE_UPDATE_DEBOUNCE_MS = 40;
     const TILE_INTERACT_UPDATE_DEBOUNCE_MS = 80;
     const TILE_WHEEL_END_DELAY_MS = 120;
     const TILE_CENTER_MARKER_SIZE = 36;
     const TILE_CENTER_MARKER_Z_OFFSET = 12;
     const TILE_NEIGHBOR_RING = 1;
-    const TARGET_VIEW_POINTS = 70000;
-    const MAX_DYNAMIC_STRIDE = 8;
+    const TARGET_VIEW_POINTS = 15000;
+    const MAX_DYNAMIC_STRIDE = 32;
     const TILE_FETCH_CONCURRENCY = 4;
 
     // Main canvas mount node. Abort early if template is not loaded as expected.
@@ -870,7 +870,10 @@
             if (visibleSeeds.length > 0) {
                 visibleSeeds.sort((a, b) => a.dist2 - b.dist2);
                 const seedTiles = visibleSeeds.map((entry) => entry.tile);
-                return expandTilesWithNeighborRing(seedTiles);
+                return {
+                    seedTiles,
+                    renderTiles: expandTilesWithNeighborRing(seedTiles),
+                };
             }
 
             // Fallback: when no center is inside current frustum, load the nearest tile.
@@ -891,7 +894,14 @@
                     nearest = tile;
                 }
             }
-            return nearest ? expandTilesWithNeighborRing([nearest]) : [];
+            if (!nearest) {
+                return { seedTiles: [], renderTiles: [] };
+            }
+
+            return {
+                seedTiles: [nearest],
+                renderTiles: expandTilesWithNeighborRing([nearest]),
+            };
         };
 
         const rebuildSceneFromVisibleTiles = (visibleTiles, sampleStep) => {
@@ -1014,8 +1024,9 @@
             const requestId = refreshSeq + 1;
             refreshSeq = requestId;
 
-            const visibleTiles = collectVisibleTiles();
-            const visiblePointEstimate = visibleTiles.reduce((acc, tile) => acc + (Number(tile.point_count) || 0), 0);
+            const { seedTiles, renderTiles } = collectVisibleTiles();
+            const visibleTiles = renderTiles;
+            const visiblePointEstimate = seedTiles.reduce((acc, tile) => acc + (Number(tile.point_count) || 0), 0);
             const dynamicStride = Math.max(
                 1,
                 Math.min(MAX_DYNAMIC_STRIDE, Math.ceil(Math.max(visiblePointEstimate, 1) / TARGET_VIEW_POINTS)),
