@@ -13,11 +13,12 @@
 
     const TILE_TARGET_POINTS = 25000;
     const TILE_VISIBLE_UPDATE_DEBOUNCE_MS = 40;
+    const TILE_INTERACT_UPDATE_DEBOUNCE_MS = 80;
     const TILE_WHEEL_END_DELAY_MS = 120;
     const TILE_CENTER_MARKER_SIZE = 36;
     const TILE_CENTER_MARKER_Z_OFFSET = 12;
     const TILE_NEIGHBOR_RING = 1;
-    const TARGET_VIEW_POINTS = 50000;
+    const TARGET_VIEW_POINTS = 70000;
     const MAX_DYNAMIC_STRIDE = 8;
     const TILE_FETCH_CONCURRENCY = 4;
 
@@ -665,6 +666,10 @@
         let firstRenderable = true;
         let refreshSeq = 0;
         let refreshTimer = null;
+        let scheduledNeedsRebuild = false;
+        let refreshInFlight = false;
+        let refreshQueued = false;
+        let refreshQueuedNeedsRebuild = false;
         let controlsInteracting = false;
         let lastInteractionType = "unknown";
 
@@ -1054,17 +1059,54 @@
             updateTileHud(visibleTiles, dynamicStride, renderedPointCount, visiblePointEstimate);
         };
 
+        const queueVisibleRefresh = (options = {}) => {
+            const skipRebuild = Boolean(options.skipRebuild);
+            refreshQueued = true;
+            if (!skipRebuild) {
+                refreshQueuedNeedsRebuild = true;
+            }
+
+            if (refreshInFlight) {
+                return;
+            }
+
+            const drain = async () => {
+                refreshInFlight = true;
+                try {
+                    while (refreshQueued) {
+                        const runSkipRebuild = !refreshQueuedNeedsRebuild;
+                        refreshQueued = false;
+                        refreshQueuedNeedsRebuild = false;
+                        await updateVisibleTiles({ skipRebuild: runSkipRebuild });
+                    }
+                } finally {
+                    refreshInFlight = false;
+                    if (refreshQueued) {
+                        void drain();
+                    }
+                }
+            };
+
+            void drain();
+        };
+
         createTileCenterMarkers();
 
         await updateVisibleTiles();
 
-        const scheduleRefresh = (delayMs) => {
+        const scheduleRefresh = (delayMs, options = {}) => {
+            const skipRebuild = Boolean(options.skipRebuild);
+            if (!skipRebuild) {
+                scheduledNeedsRebuild = true;
+            }
             if (refreshTimer) {
                 window.clearTimeout(refreshTimer);
             }
             refreshTimer = window.setTimeout(() => {
                 refreshTimer = null;
-                void updateVisibleTiles();
+                const runSkipRebuild = !scheduledNeedsRebuild;
+                scheduledNeedsRebuild = false;
+                queueVisibleRefresh({ skipRebuild: runSkipRebuild });
             }, delayMs);
         };
 
@@ -1091,10 +1133,9 @@
         });
 
         RenderModule.controls.addEventListener("change", () => {
-            // Avoid heavy refresh while user is actively dragging/zooming.
+            // Avoid heavy refresh storm while user is actively dragging/zooming.
             if (controlsInteracting) {
-                // During interaction we only update lightweight tile state, no geometry rebuild.
-                void updateVisibleTiles({ skipRebuild: true });
+                scheduleRefresh(TILE_INTERACT_UPDATE_DEBOUNCE_MS, { skipRebuild: true });
                 return;
             }
             scheduleRefresh(TILE_VISIBLE_UPDATE_DEBOUNCE_MS);
@@ -1105,9 +1146,11 @@
             if (lastInteractionType === "wheel") {
                 // Wheel emits dense events; delay refresh slightly to avoid per-notch stalls.
                 scheduleRefresh(TILE_WHEEL_END_DELAY_MS);
+                lastInteractionType = "unknown";
                 return;
             }
-            void updateVisibleTiles();
+            lastInteractionType = "unknown";
+            queueVisibleRefresh();
         });
     }
 
