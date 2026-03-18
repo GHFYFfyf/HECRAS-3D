@@ -7,7 +7,7 @@ from time import perf_counter
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import h5py
@@ -113,6 +113,210 @@ def _build_square_tile_bounds(
 				continue
 			bounds.append((row_start, row_end, col_start, col_end))
 	return tile_axis_count, bounds
+
+
+def _sample_tif_tile_window(
+	*,
+	src: rasterio.io.DatasetReader,
+	row_start: int,
+	row_end: int,
+	col_start: int,
+	col_end: int,
+	stride: int,
+) -> dict[str, Any]:
+	if row_start >= row_end or col_start >= col_end:
+		raise HTTPException(status_code=400, detail="Invalid tile window")
+	if row_end > src.height or col_end > src.width:
+		raise HTTPException(status_code=400, detail="Tile window out of raster bounds")
+
+	window = Window(col_start, row_start, col_end - col_start, row_end - row_start)
+	band = src.read(1, masked=True, window=window)
+	valid_mask = ~np.ma.getmaskarray(band)
+
+	# Align tile sampling to a global stride phase so adjacent tiles use
+	# consistent row/col lattices and can be connected across tile seams.
+	first_row = row_start + ((-row_start) % stride)
+	first_col = col_start + ((-col_start) % stride)
+	if first_row >= row_end:
+		first_row = row_start
+	if first_col >= col_end:
+		first_col = col_start
+
+	sampled_rows = np.arange(first_row, row_end, stride, dtype=np.int32)
+	sampled_cols = np.arange(first_col, col_end, stride, dtype=np.int32)
+	if sampled_rows.size == 0 or sampled_cols.size == 0:
+		return {
+			"rows": np.empty(0, dtype=np.int32),
+			"cols": np.empty(0, dtype=np.int32),
+			"x_vals": np.empty(0, dtype=np.float32),
+			"y_vals": np.empty(0, dtype=np.float32),
+			"z_vals": np.empty(0, dtype=np.float32),
+			"valid_flat": np.empty(0, dtype=np.uint8),
+			"grid_rows": 0,
+			"grid_cols": 0,
+		}
+
+	grid_rows, grid_cols = np.meshgrid(sampled_rows, sampled_cols, indexing="ij")
+	rows = np.asarray(grid_rows.ravel(), dtype=np.int32)
+	cols = np.asarray(grid_cols.ravel(), dtype=np.int32)
+
+	local_rows = rows - row_start
+	local_cols = cols - col_start
+	valid_flat = np.asarray(valid_mask[local_rows, local_cols], dtype=np.uint8)
+	sampled_band = band[local_rows, local_cols].astype(np.float64)
+	z_values = np.asarray(np.ma.filled(sampled_band, np.nan), dtype=np.float32)
+	x_vals, y_vals = rasterio.transform.xy(src.transform, rows, cols, offset="center")
+
+	return {
+		"rows": rows,
+		"cols": cols,
+		"x_vals": np.asarray(x_vals, dtype=np.float32),
+		"y_vals": np.asarray(y_vals, dtype=np.float32),
+		"z_vals": z_values,
+		"valid_flat": valid_flat,
+		"grid_rows": int(sampled_rows.size),
+		"grid_cols": int(sampled_cols.size),
+	}
+
+
+def _build_tif_tile_points_json(
+	*,
+	project_id: int,
+	row_start: int,
+	row_end: int,
+	col_start: int,
+	col_end: int,
+	stride: int,
+	sample: dict[str, Any],
+) -> dict[str, object]:
+	rows = sample["rows"]
+	cols = sample["cols"]
+	x_vals = sample["x_vals"]
+	y_vals = sample["y_vals"]
+	z_values = sample["z_vals"]
+	valid_flat = sample["valid_flat"]
+	grid_rows = int(sample["grid_rows"])
+	grid_cols = int(sample["grid_cols"])
+
+	if rows.size == 0 or cols.size == 0:
+		return {
+			"project_id": project_id,
+			"point_count": 0,
+			"stride": int(stride),
+			"window": {
+				"row_start": int(row_start),
+				"row_end": int(row_end),
+				"col_start": int(col_start),
+				"col_end": int(col_end),
+			},
+			"grid": {"rows": 0, "cols": 0},
+			"vertices": [],
+			"points": [],
+		}
+
+	vertices = [
+		{
+			"sample_row": int(row),
+			"sample_col": int(col),
+			"row": int(row),
+			"col": int(col),
+			"x": float(x),
+			"y": float(y),
+			"elevation": float(z) if bool(valid) else None,
+			"valid": bool(valid),
+		}
+		for row, col, x, y, z, valid in zip(
+			rows,
+			cols,
+			x_vals,
+			y_vals,
+			z_values,
+			valid_flat,
+			strict=False,
+		)
+	]
+
+	points = [
+		[float(x), float(y), float(z)]
+		for x, y, z, valid in zip(x_vals, y_vals, z_values, valid_flat, strict=False)
+		if bool(valid)
+	]
+
+	return {
+		"project_id": project_id,
+		"point_count": len(points),
+		"stride": int(stride),
+		"window": {
+			"row_start": int(row_start),
+			"row_end": int(row_end),
+			"col_start": int(col_start),
+			"col_end": int(col_end),
+		},
+		"grid": {
+			"rows": int(grid_rows),
+			"cols": int(grid_cols),
+		},
+		"vertices": vertices,
+		"points": points,
+	}
+
+
+def _encode_tif_tile_points_binary(
+	*,
+	project_id: int,
+	row_start: int,
+	row_end: int,
+	col_start: int,
+	col_end: int,
+	stride: int,
+	sample: dict[str, Any],
+) -> bytes:
+	"""Pack tile samples to a compact little-endian binary payload.
+
+	Header layout (int32 x 11):
+	magic, project_id, stride, row_start, row_end, col_start, col_end,
+	grid_rows, grid_cols, sample_count, point_count.
+	Then arrays in order:
+	rows(int32), cols(int32), x(float32), y(float32), z(float32), valid(uint8).
+	"""
+	rows = np.asarray(sample["rows"], dtype=np.int32)
+	cols = np.asarray(sample["cols"], dtype=np.int32)
+	x_vals = np.asarray(sample["x_vals"], dtype=np.float32)
+	y_vals = np.asarray(sample["y_vals"], dtype=np.float32)
+	z_vals = np.asarray(sample["z_vals"], dtype=np.float32)
+	valid = np.asarray(sample["valid_flat"], dtype=np.uint8)
+	grid_rows = int(sample["grid_rows"])
+	grid_cols = int(sample["grid_cols"])
+	sample_count = int(rows.size)
+	point_count = int(valid.sum()) if sample_count else 0
+
+	header = np.asarray(
+		[
+			0x54494631,  # "TIF1"
+			int(project_id),
+			int(stride),
+			int(row_start),
+			int(row_end),
+			int(col_start),
+			int(col_end),
+			grid_rows,
+			grid_cols,
+			sample_count,
+			point_count,
+		],
+		dtype=np.int32,
+	)
+
+	chunks = [
+		header.tobytes(order="C"),
+		rows.tobytes(order="C"),
+		cols.tobytes(order="C"),
+		x_vals.tobytes(order="C"),
+		y_vals.tobytes(order="C"),
+		z_vals.tobytes(order="C"),
+		valid.tobytes(order="C"),
+	]
+	return b"".join(chunks)
 
 app = FastAPI(title="HEC-RAS 3D Project Manager")
 app.mount("/assets", StaticFiles(directory=BASE_DIR / "assets"), name="assets")
@@ -428,98 +632,65 @@ def get_project_tif_tile_points(
 		raise HTTPException(status_code=404, detail="TIF file not found")
 
 	with rasterio.open(tif_path) as src:
-		if row_start >= row_end or col_start >= col_end:
-			raise HTTPException(status_code=400, detail="Invalid tile window")
-		if row_end > src.height or col_end > src.width:
-			raise HTTPException(status_code=400, detail="Tile window out of raster bounds")
+		sample = _sample_tif_tile_window(
+			src=src,
+			row_start=row_start,
+			row_end=row_end,
+			col_start=col_start,
+			col_end=col_end,
+			stride=stride,
+		)
 
-		window = Window(col_start, row_start, col_end - col_start, row_end - row_start)
-		band = src.read(1, masked=True, window=window)
-		valid_mask = ~np.ma.getmaskarray(band)
+		return _build_tif_tile_points_json(
+			project_id=project_id,
+			row_start=row_start,
+			row_end=row_end,
+			col_start=col_start,
+			col_end=col_end,
+			stride=stride,
+			sample=sample,
+		)
 
-		# Align tile sampling to a global stride phase so adjacent tiles use
-		# consistent row/col lattices and can be connected across tile seams.
-		first_row = row_start + ((-row_start) % stride)
-		first_col = col_start + ((-col_start) % stride)
-		if first_row >= row_end:
-			first_row = row_start
-		if first_col >= col_end:
-			first_col = col_start
 
-		sampled_rows = np.arange(first_row, row_end, stride, dtype=np.int32)
-		sampled_cols = np.arange(first_col, col_end, stride, dtype=np.int32)
-		if sampled_rows.size == 0 or sampled_cols.size == 0:
-			return {
-				"project_id": project_id,
-				"point_count": 0,
-				"stride": int(stride),
-				"window": {
-					"row_start": int(row_start),
-					"row_end": int(row_end),
-					"col_start": int(col_start),
-					"col_end": int(col_end),
-				},
-				"grid": {"rows": 0, "cols": 0},
-				"vertices": [],
-				"points": [],
-			}
+@app.get("/api/projects/{project_id}/tif-tile-points-binary")
+def get_project_tif_tile_points_binary(
+	project_id: int,
+	row_start: int = Query(ge=0),
+	row_end: int = Query(ge=1),
+	col_start: int = Query(ge=0),
+	col_end: int = Query(ge=1),
+	stride: int = Query(default=1, ge=1, le=32),
+	db: Session = Depends(get_db),
+) -> Response:
+	"""Return compact binary tile samples for faster transfer and decode."""
+	project = db.get(Project, project_id)
+	if project is None:
+		raise HTTPException(status_code=404, detail="Project not found")
 
-		grid_rows, grid_cols = np.meshgrid(sampled_rows, sampled_cols, indexing="ij")
-		rows = grid_rows.ravel()
-		cols = grid_cols.ravel()
+	tif_path = (BASE_DIR / project.tif_path).resolve()
+	if not tif_path.exists():
+		raise HTTPException(status_code=404, detail="TIF file not found")
 
-		local_rows = rows - row_start
-		local_cols = cols - col_start
-		valid_flat = valid_mask[local_rows, local_cols]
-		sampled_band = band[local_rows, local_cols].astype(np.float64)
-		z_values = np.asarray(np.ma.filled(sampled_band, np.nan), dtype=np.float64)
-		x_vals, y_vals = rasterio.transform.xy(src.transform, rows, cols, offset="center")
+	with rasterio.open(tif_path) as src:
+		sample = _sample_tif_tile_window(
+			src=src,
+			row_start=row_start,
+			row_end=row_end,
+			col_start=col_start,
+			col_end=col_end,
+			stride=stride,
+		)
 
-		vertices = [
-			{
-				"sample_row": int(row),
-				"sample_col": int(col),
-				"row": int(row),
-				"col": int(col),
-				"x": float(x),
-				"y": float(y),
-				"elevation": float(z) if bool(valid) else None,
-				"valid": bool(valid),
-			}
-			for row, col, x, y, z, valid in zip(
-				rows,
-				cols,
-				x_vals,
-				y_vals,
-				z_values,
-				valid_flat,
-				strict=False,
-			)
-		]
-
-		points = [
-			[float(x), float(y), float(z)]
-			for x, y, z, valid in zip(x_vals, y_vals, z_values, valid_flat, strict=False)
-			if bool(valid)
-		]
-
-		return {
-			"project_id": project_id,
-			"point_count": len(points),
-			"stride": int(stride),
-			"window": {
-				"row_start": int(row_start),
-				"row_end": int(row_end),
-				"col_start": int(col_start),
-				"col_end": int(col_end),
-			},
-			"grid": {
-				"rows": int(sampled_rows.size),
-				"cols": int(sampled_cols.size),
-			},
-			"vertices": vertices,
-			"points": points,
-		}
+	payload = _encode_tif_tile_points_binary(
+		project_id=project_id,
+		row_start=row_start,
+		row_end=row_end,
+		col_start=col_start,
+		col_end=col_end,
+		stride=stride,
+		sample=sample,
+	)
+	return Response(content=payload, media_type="application/octet-stream")
 
 
 @app.get("/api/projects/{project_id}/hdf-water-depth")

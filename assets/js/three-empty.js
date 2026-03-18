@@ -21,6 +21,8 @@
     const TARGET_VIEW_POINTS = 15000;
     const MAX_DYNAMIC_STRIDE = 32;
     const TILE_FETCH_CONCURRENCY = 4;
+    const TIF_TILE_BINARY_MAGIC = 0x54494631;
+    const TIF_TILE_BINARY_HEADER_INT32_COUNT = 11;
 
     // Main canvas mount node. Abort early if template is not loaded as expected.
     const container = document.getElementById("threeRoot");
@@ -53,10 +55,17 @@
     const hudLoadedTiles = ensureHudLine("hudLoadedTiles", "Loaded", "--");
     const hudThinFactor = ensureHudLine("hudThinFactor", "Thin", "--");
     const hudThinPoints = ensureHudLine("hudThinPoints", "ThinPts", "--");
+    const hudFetchMode = ensureHudLine("hudFetchMode", "Fetch", "--");
+    const hudFetchBytes = ensureHudLine("hudFetchBytes", "Bytes", "--");
+    const hudFetchPacket = ensureHudLine("hudFetchPacket", "Packet", "--");
 
     // URL state: /three?project_id=... .
     const params = new URLSearchParams(window.location.search);
     let projectId = params.get("project_id");
+    const DEBUG_FETCH_LOG = params.get("debug_fetch") === "1";
+    const DEBUG_BINARY_PREVIEW_BYTES = 64;
+    let hasLoggedBinarySample = false;
+    let hasLoggedJsonFallback = false;
 
 
     /**
@@ -125,13 +134,187 @@
                 col_end: String(tile.col_end),
                 stride: String(Math.max(1, Math.min(MAX_DYNAMIC_STRIDE, Math.trunc(stride) || 1))),
             });
-            const response = await fetch(
-                `/api/projects/${encodeURIComponent(resolvedProjectId)}/tif-tile-points?${query.toString()}`,
-            );
-            if (!response.ok) {
-                throw new Error(`Failed to load tif tile points: HTTP ${response.status}`);
+            const binaryUrl = `/api/projects/${encodeURIComponent(resolvedProjectId)}/tif-tile-points-binary?${query.toString()}`;
+            const legacyUrl = `/api/projects/${encodeURIComponent(resolvedProjectId)}/tif-tile-points?${query.toString()}`;
+
+            const binaryResponse = await fetch(binaryUrl, {
+                headers: { Accept: "application/octet-stream, application/json" },
+            });
+
+            if (binaryResponse.ok) {
+                const contentType = String(binaryResponse.headers.get("content-type") || "").toLowerCase();
+                if (contentType.includes("application/octet-stream")) {
+                    const buffer = await binaryResponse.arrayBuffer();
+                    const payload = this.parseTifTileBinaryPayload(buffer);
+                    payload._transport = "binary";
+                    payload._transport_bytes = buffer.byteLength;
+                    payload._transport_content_type = contentType;
+                    return payload;
+                }
+                const payload = await binaryResponse.json();
+                payload._transport = "binary-endpoint-json";
+                payload._transport_content_type = contentType;
+                return payload;
             }
-            return response.json();
+
+            // Compatibility fallback for older backend without binary endpoint.
+            if (binaryResponse.status !== 404) {
+                throw new Error(`Failed to load tif tile points (binary): HTTP ${binaryResponse.status}`);
+            }
+
+            const legacyResponse = await fetch(legacyUrl, { headers: { Accept: "application/json" } });
+            if (!legacyResponse.ok) {
+                throw new Error(`Failed to load tif tile points: HTTP ${legacyResponse.status}`);
+            }
+            const payload = await legacyResponse.json();
+            payload._transport = "json-fallback";
+            payload._transport_content_type = "application/json";
+            payload._transport_fallback_reason = `binary status ${binaryResponse.status}`;
+            if (DEBUG_FETCH_LOG || !hasLoggedJsonFallback) {
+                console.warn("[tif-tile-fetch] fallback to JSON", {
+                    reason: payload._transport_fallback_reason,
+                    tile: {
+                        row_start: tile.row_start,
+                        row_end: tile.row_end,
+                        col_start: tile.col_start,
+                        col_end: tile.col_end,
+                    },
+                });
+                hasLoggedJsonFallback = true;
+            }
+            return payload;
+        },
+
+        formatHexPreview(buffer, maxBytes = DEBUG_BINARY_PREVIEW_BYTES) {
+            const bytes = new Uint8Array(buffer, 0, Math.min(maxBytes, buffer.byteLength));
+            const parts = new Array(bytes.length);
+            for (let i = 0; i < bytes.length; i += 1) {
+                parts[i] = bytes[i].toString(16).padStart(2, "0");
+            }
+            return parts.join(" ");
+        },
+
+        /**
+         * parseTifTileBinaryPayload
+         * Function: Decode compact tile binary payload into legacy JSON-like shape.
+         * Input: ArrayBuffer from /tif-tile-points-binary.
+         * Output: { project_id, point_count, stride, window, grid, vertices, points }.
+         */
+        parseTifTileBinaryPayload(buffer) {
+            const view = new DataView(buffer);
+            const headerBytes = TIF_TILE_BINARY_HEADER_INT32_COUNT * 4;
+            if (buffer.byteLength < headerBytes) {
+                throw new Error("Invalid tif binary payload: header too short");
+            }
+
+            const magic = view.getInt32(0, true) >>> 0;
+            if (magic !== TIF_TILE_BINARY_MAGIC) {
+                throw new Error("Invalid tif binary payload: bad magic");
+            }
+
+            const projectIdFromPayload = view.getInt32(4, true);
+            const stride = view.getInt32(8, true);
+            const rowStart = view.getInt32(12, true);
+            const rowEnd = view.getInt32(16, true);
+            const colStart = view.getInt32(20, true);
+            const colEnd = view.getInt32(24, true);
+            const gridRows = view.getInt32(28, true);
+            const gridCols = view.getInt32(32, true);
+            const sampleCount = view.getInt32(36, true);
+            const pointCountFromHeader = view.getInt32(40, true);
+
+            const headerSummary = {
+                magic: `0x${magic.toString(16)}`,
+                project_id: projectIdFromPayload,
+                stride,
+                row_start: rowStart,
+                row_end: rowEnd,
+                col_start: colStart,
+                col_end: colEnd,
+                grid_rows: gridRows,
+                grid_cols: gridCols,
+                sample_count: sampleCount,
+                point_count: pointCountFromHeader,
+                total_bytes: buffer.byteLength,
+            };
+
+            const hexPreview = this.formatHexPreview(buffer);
+            if (DEBUG_FETCH_LOG || !hasLoggedBinarySample) {
+                console.log("[tif-tile-binary] header", headerSummary);
+                console.log("[tif-tile-binary] head hex", hexPreview);
+                hasLoggedBinarySample = true;
+            }
+
+            if (sampleCount < 0) {
+                throw new Error("Invalid tif binary payload: negative sample count");
+            }
+
+            let offset = headerBytes;
+            const i32Bytes = sampleCount * 4;
+            const f32Bytes = sampleCount * 4;
+            const u8Bytes = sampleCount;
+            const expectedBytes = headerBytes + i32Bytes + i32Bytes + f32Bytes + f32Bytes + f32Bytes + u8Bytes;
+            if (buffer.byteLength < expectedBytes) {
+                throw new Error("Invalid tif binary payload: truncated arrays");
+            }
+
+            const rows = new Int32Array(buffer, offset, sampleCount);
+            offset += i32Bytes;
+            const cols = new Int32Array(buffer, offset, sampleCount);
+            offset += i32Bytes;
+            const xVals = new Float32Array(buffer, offset, sampleCount);
+            offset += f32Bytes;
+            const yVals = new Float32Array(buffer, offset, sampleCount);
+            offset += f32Bytes;
+            const zVals = new Float32Array(buffer, offset, sampleCount);
+            offset += f32Bytes;
+            const valid = new Uint8Array(buffer, offset, sampleCount);
+
+            const vertices = new Array(sampleCount);
+            const points = [];
+            for (let i = 0; i < sampleCount; i += 1) {
+                const row = rows[i];
+                const col = cols[i];
+                const x = Number(xVals[i]);
+                const y = Number(yVals[i]);
+                const z = Number(zVals[i]);
+                const isValid = valid[i] !== 0 && Number.isFinite(z);
+
+                vertices[i] = {
+                    sample_row: row,
+                    sample_col: col,
+                    row,
+                    col,
+                    x,
+                    y,
+                    elevation: isValid ? z : null,
+                    valid: isValid,
+                };
+
+                if (isValid) {
+                    points.push([x, y, z]);
+                }
+            }
+
+            return {
+                project_id: projectIdFromPayload,
+                point_count: Number.isFinite(pointCountFromHeader) ? pointCountFromHeader : points.length,
+                stride,
+                _binary_header: headerSummary,
+                _binary_head_hex: hexPreview,
+                window: {
+                    row_start: rowStart,
+                    row_end: rowEnd,
+                    col_start: colStart,
+                    col_end: colEnd,
+                },
+                grid: {
+                    rows: gridRows,
+                    cols: gridCols,
+                },
+                vertices,
+                points,
+            };
         },
 
         /**
@@ -741,6 +924,28 @@
             const targetPerTile = Number(tileMeta.target_points_per_tile) || TILE_TARGET_POINTS;
             const approxPerTile = tileCount > 0 ? Math.round(validTotal / tileCount) : 0;
             const loadedTiles = tiles.filter((tile) => tileCache.has(tileKey(tile)));
+            let binaryCount = 0;
+            let jsonFallbackCount = 0;
+            let otherCount = 0;
+            let totalTransportBytes = 0;
+
+            for (let i = 0; i < visibleTiles.length; i += 1) {
+                const cached = tileCache.get(tileKey(visibleTiles[i]));
+                if (!cached) {
+                    continue;
+                }
+                if (cached._transport === "binary") {
+                    binaryCount += 1;
+                } else if (cached._transport === "json-fallback") {
+                    jsonFallbackCount += 1;
+                } else if (cached._transport) {
+                    otherCount += 1;
+                }
+
+                if (Number.isFinite(cached._transport_bytes)) {
+                    totalTransportBytes += Number(cached._transport_bytes);
+                }
+            }
 
             if (hudTileCount) {
                 hudTileCount.textContent = `${tileCount} (${tileMeta.tile_grid?.rows || 0}x${tileMeta.tile_grid?.cols || 0})`;
@@ -759,6 +964,25 @@
             }
             if (hudThinPoints) {
                 hudThinPoints.textContent = String(renderedPointCount);
+            }
+            if (hudFetchMode) {
+                hudFetchMode.textContent = `bin ${binaryCount} / json ${jsonFallbackCount} / other ${otherCount}`;
+            }
+            if (hudFetchBytes) {
+                hudFetchBytes.textContent = totalTransportBytes > 0 ? `${(totalTransportBytes / 1024).toFixed(1)} KB` : "--";
+            }
+            if (hudFetchPacket) {
+                let packetText = "--";
+                for (let i = 0; i < visibleTiles.length; i += 1) {
+                    const cached = tileCache.get(tileKey(visibleTiles[i]));
+                    if (!cached || cached._transport !== "binary" || !cached._binary_header) {
+                        continue;
+                    }
+                    const h = cached._binary_header;
+                    packetText = `m ${h.magic} s ${h.sample_count} p ${h.point_count} b ${h.total_bytes}`;
+                    break;
+                }
+                hudFetchPacket.textContent = packetText;
             }
         };
 
