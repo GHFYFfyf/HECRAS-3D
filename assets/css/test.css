@@ -247,6 +247,28 @@ button.action-pill:hover,
     box-shadow: 0 0 10px rgba(255, 255, 255, 0.25);
 }
 
+.stats-pill {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 0.2rem;
+    padding: 0.45rem 0.55rem;
+    border-radius: 0.5rem;
+    border: 1px solid rgba(103, 187, 255, 0.22);
+    background: linear-gradient(180deg, rgba(8, 22, 38, 0.76) 0%, rgba(4, 12, 24, 0.8) 100%);
+}
+
+.stats-pill__label {
+    color: #7ba6ca;
+    letter-spacing: 0.04em;
+}
+
+.stats-pill__value {
+    color: #d8ebff;
+    font-size: 11px;
+    font-weight: 600;
+}
+
 @keyframes spin-slow {
     from { transform: rotate(0deg); }
     to { transform: rotate(360deg); }

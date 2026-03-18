@@ -405,9 +405,10 @@
     const OverlayModule = {
         /**
          * sampleDepthRamp
-         * Function: Convert normalized depth ratio to RGB via piecewise interpolation.
-         * Input: t in [0,1].
-         * Output: [r,g,b] in [0,1].
+         * 主要功能: 根据深度比例（t在[0,1]之间）从定义的颜色渐变中采样对应的 RGB 颜色。
+         * 输入参数:
+         *   - t: 归一化深度值 (number, 0~1)
+         * 输出: [r, g, b] 归一化颜色数组 (array)
          */
         sampleDepthRamp(t) {
             if (t <= WATER_DEPTH_COLOR_GRADIENT[0].t) {
@@ -432,16 +433,11 @@
 
         /**
          * buildSmoothedSurfaceGeometry
-         * Function: Convert irregular wet-cell points into a smooth triangulated surface mesh.
-         * Key variables: grid size bounds, hole-fill passes, smoothing passes, depth range.
-         * Flow:
-         * 1) derive XY/depth bounds
-         * 2) bin points to regular grid
-         * 3) fill sparse holes from neighbors
-         * 4) smooth grid values
-         * 5) emit position/color/index buffers
-         * Input: points ([[x,y,bed,water,depth],...]), centerX/centerY (reserved for compatibility).
-         * Output: geometry descriptor or null when insufficient data.
+         * 主要功能: 将离散的水深点数据处理成平滑的网格几何体。包括边界计算、网格化、空洞填充和拉普拉斯平滑。
+         * 输入参数:
+         *   - points: 原始点数据数组 [[x,y,bed,water,depth], ...] (array)
+         *   - centerX/centerY: 兼容性中心坐标 (number)
+         * 输出: 包含 BufferGeometry 和元数据的对象，若失败则返回 null (object|null)
          */
         buildSmoothedSurfaceGeometry(points, centerX, centerY) {
             if (!Array.isArray(points) || points.length === 0) {
@@ -689,11 +685,11 @@
 
         /**
          * buildPointFallbackGeometry
-         * Function: Build colored point-cloud geometry directly from sampled points.
-         * Key variables: depthRange, WATER_FORCED_Z_LIFT.
-         * Flow: validate points -> map depth to color -> write typed arrays.
-         * Input: points ([[x,y,bed,water,depth],...]), centerX/centerY (reserved).
-         * Output: geometry descriptor with renderMode=points, or null.
+         * 主要功能: 备用方案，将点数据直接转换为带颜色顶点的点云几何体。
+         * 输入参数:
+         *   - points: 原始点数据数组 (array)
+         *   - centerX/centerY: 兼容性中心坐标 (number)
+         * 输出: 包含 BufferGeometry 和元数据的对象，若失败则返回 null (object|null)
          */
         buildPointFallbackGeometry(points, centerX, centerY) {
             if (!Array.isArray(points) || points.length === 0) {
@@ -766,11 +762,11 @@
 
         /**
          * createOrUpdateWaterDepthOverlay
-         * Function: Render current payload using selected render mode and update existing scene object.
-         * Key variables: RuntimeState.renderMode, RuntimeState.overlay.
-         * Flow: choose prepared geometry -> reconcile object type (points/mesh) -> update geometry/material.
-         * Input: bridge (scene handles), payload (water depth frame).
-         * Output: none.
+         * 主要功能: 根据当前渲染模式更新或创建水深叠加层（Mesh 或 Points）。维护一个调试用的球体位置。
+         * 输入参数:
+         *   - bridge: 包含场景实例的 bridge 对象 (object)
+         *   - payload: 包含水深点数据的载荷 (object)
+         * 输出: 无 (直接操作场景对象)
          */
         createOrUpdateWaterDepthOverlay(bridge, payload) {
             const points = Array.isArray(payload && payload.points) ? payload.points : [];
@@ -873,9 +869,10 @@
     const RuntimeModule = {
         /**
          * setRenderMode
-         * Function: Normalize and apply render mode.
-         * Input: mode candidate string.
-         * Output: boolean; true when mode changed, false when unchanged.
+         * 主要功能: 规范化并应用渲染模式（auto/surface/points）。
+         * 输入参数:
+         *   - mode: 模式候选字符串 (string)
+         * 输出: 模式是否发生改变 (boolean)
          */
         setRenderMode(mode) {
             const normalized = String(mode || "").toLowerCase();
@@ -892,11 +889,11 @@
 
         /**
          * loadAndRenderTimeIndex
-         * Function: Fetch selected frame and push it through diagnostics/UI/overlay pipeline.
-         * Key variables: isLoading, lastRequestId guard against stale responses.
-         * Flow: request -> stale-check -> diagnostics + UI sync -> overlay update.
-         * Input: timeIndex (integer).
-         * Output: Promise<void>.
+         * 主要功能: 异步加载指定时间索引的 HDF 水深帧，并通过诊断、UI 同步和叠加层更新流程进行处理。包含竞态检查。
+         * 输入参数:
+         *   - timeIndex: 时间步索引，-1 表示由后端决定默认帧 (number)
+         * 异步顺序: 异步 Fetch -> 检查 requestId 是否过时 -> 同步渲染。
+         * 输出: Promise<void>
          */
         async loadAndRenderTimeIndex(timeIndex) {
             if (!RuntimeState.bridge || !RuntimeState.projectId || RuntimeState.isLoading) {
@@ -931,8 +928,8 @@
 
         /**
          * bindTimelineEvent
-         * Function: Listen to `hdf-time-selected` and trigger frame reload.
-         * Input/Output: none.
+         * 主要功能: 订阅时间轴选择事件并触发对应的帧加载逻辑。
+         * 输入/输出: 无
          */
         bindTimelineEvent() {
             window.addEventListener("hdf-time-selected", (event) => {
@@ -947,8 +944,8 @@
 
         /**
          * bindRenderModeEvent
-         * Function: Listen to render-mode changes and re-render current frame.
-         * Input/Output: none.
+         * 主要功能: 订阅渲染模式切换事件并触发当前帧的重新渲染。
+         * 输入/输出: 无
          */
         bindRenderModeEvent() {
             window.addEventListener("hdf-render-mode-changed", (event) => {
@@ -968,8 +965,8 @@
 
         /**
          * bindDebugShortcuts
-         * Function: Placeholder for optional keyboard debug controls.
-         * Input/Output: none.
+         * 主要功能: 调试快捷键绑定的占位函数。
+         * 输入/输出: 无
          */
         bindDebugShortcuts() {
             // Intentionally kept empty.
@@ -977,15 +974,9 @@
 
         /**
          * bootstrap
-         * Function: Initialize module wiring and render initial frame.
-         * Flow:
-         * 1) wait for base scene
-         * 2) resolve project and mode
-         * 3) fetch default frame
-         * 4) create UI and bind events
-         * 5) render first overlay
-         * Input: none.
-         * Output: Promise<void>.
+         * 主要功能: 叠加层模块的启动入口。等待主场景就绪后，初始化项目 ID、渲染模式、默认帧并绑定 UI 事件。
+         * 异步顺序: 等待 baseScene -> 等待 projectId -> 异步加载第一帧。
+         * 输入/输出: Promise<void>
          */
         async bootstrap() {
             const bridge = await DataModule.waitForBaseScene(8000);

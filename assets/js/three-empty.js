@@ -18,7 +18,7 @@
     const TILE_CENTER_MARKER_SIZE = 36;
     const TILE_CENTER_MARKER_Z_OFFSET = 12;
     const TILE_NEIGHBOR_RING = 1;
-    const TARGET_VIEW_POINTS = 15000;
+    const TARGET_VIEW_POINTS = 20000;
     const MAX_DYNAMIC_STRIDE = 32;
     const TILE_FETCH_CONCURRENCY = 4;
     const TIF_TILE_BINARY_MAGIC = 0x54494631;
@@ -35,6 +35,15 @@
     const hudLoad = document.getElementById("hudLoad");
     const hudFps = document.getElementById("hudFps");
 
+    /**
+     * ensureHudLine
+     * 主要功能: 在 DOM 的 HUD 面板中确保存在指定的行，如果不存在则创建它。
+     * 输入参数:
+     *   - id: 元素 ID (string)
+     *   - label: 显示的标签文本 (string)
+     *   - defaultText: 初始显示的默认值 (string)
+     * 输出: 返回找到或创建的 span 元素对象 (HTMLElement|null)
+     */
     const ensureHudLine = (id, label, defaultText) => {
         const existing = document.getElementById(id);
         if (existing) {
@@ -185,6 +194,14 @@
             return payload;
         },
 
+        /**
+         * formatHexPreview
+         * 主要功能: 将 ArrayBuffer 转换为可阅读的十六进制文本预览。
+         * 输入参数:
+         *   - buffer: 需要预览的 ArrayBuffer (ArrayBuffer)
+         *   - maxBytes: 最大显示的字节数 (number)
+         * 输出: 十六进制字符串 (string)
+         */
         formatHexPreview(buffer, maxBytes = DEBUG_BINARY_PREVIEW_BYTES) {
             const bytes = new Uint8Array(buffer, 0, Math.min(maxBytes, buffer.byteLength));
             const parts = new Array(bytes.length);
@@ -338,6 +355,13 @@
             console.log("[tif-points] points sample", pointsFromPayload.slice(0, 5));
         },
 
+        /**
+         * logTileMetaSummary
+         * 主要功能: 打印瓦片元数据的简要统计信息到控制台。
+         * 输入参数:
+         *   - payload: 包含 tile_count, tile_grid, valid_point_count 等的元数据对象 (object)
+         * 输出: 无 (控制台输出)
+         */
         logTileMetaSummary(payload) {
             const tiles = Array.isArray(payload.tiles) ? payload.tiles : [];
             console.log("[tif-tiles] summary", {
@@ -517,26 +541,19 @@
         },
 
         /**
-         * createColoredTriangleLines
-         * Function: Rebuild wireframe-like triangle edges from grid-aware sampled vertices.
-         * Key variables: keyToGeometryIndex map, triangleIndices, edgeSet.
-         * Flow:
-         * 1) map valid sampled vertices to local geometry indices
-         * 2) reconstruct quad triangles from row/col neighbors
-         * 3) deduplicate shared edges
-         * 4) emit colored line segments
-         * Input: vertices, centerX/centerY (reserved), minZ, zRange.
-         * Output: THREE.LineSegments or null.
+         * createIndexedSurfaceMesh
+         * Function: Build one batched indexed triangle surface from sampled grid vertices.
+         * Color rule: each triangle uses one flat color sampled from triangle-center elevation.
+         * Input: vertices, centerX/centerY (reserved), minZ, zRange, sampleStep.
+         * Output: THREE.Mesh or null.
          */
-        createColoredTriangleLines(vertices, centerX, centerY, minZ, zRange, sampleStep = 1) {
+        createIndexedSurfaceMesh(vertices, centerX, centerY, minZ, zRange, sampleStep = 1) {
             if (!Array.isArray(vertices) || !vertices.length) {
                 return null;
             }
 
             const keyToGeometryIndex = new Map();
             const geometryPositions = [];
-            const geometryVertexColors = [];
-
             const getColorForZ = (zValue) => {
                 const t = THREE.MathUtils.clamp((zValue - minZ) / Math.max(zRange, 1e-9), 0, 1);
                 return MeshModule.sampleElevationRamp(t);
@@ -560,9 +577,6 @@
                 const key = `${sampleRow}_${sampleCol}`;
                 keyToGeometryIndex.set(key, geometryPositions.length / 3);
                 geometryPositions.push(x, y, z);
-
-                const [r, g, b] = getColorForZ(z);
-                geometryVertexColors.push(r, g, b);
             }
 
             const rowStep = Math.max(1, Math.trunc(sampleStep) || 1);
@@ -601,56 +615,58 @@
                 return null;
             }
 
-            const edgePositionArray = [];
-            const edgeColorArray = [];
-            const edgeSet = new Set();
-
-            const appendEdge = (idxA, idxB) => {
-                const edgeKey = idxA < idxB ? `${idxA}_${idxB}` : `${idxB}_${idxA}`;
-                if (edgeSet.has(edgeKey)) {
-                    return;
-                }
-                edgeSet.add(edgeKey);
-
-                const baseA = idxA * 3;
-                const baseB = idxB * 3;
-
-                edgePositionArray.push(
-                    geometryPositions[baseA], geometryPositions[baseA + 1], geometryPositions[baseA + 2],
-                    geometryPositions[baseB], geometryPositions[baseB + 1], geometryPositions[baseB + 2],
-                );
-
-                edgeColorArray.push(
-                    geometryVertexColors[baseA], geometryVertexColors[baseA + 1], geometryVertexColors[baseA + 2],
-                    geometryVertexColors[baseB], geometryVertexColors[baseB + 1], geometryVertexColors[baseB + 2],
-                );
-            };
+            const trianglePositions = [];
+            const triangleColors = [];
+            const triangleMeshIndices = [];
+            let vertexCursor = 0;
 
             for (let i = 0; i < triangleIndices.length; i += 3) {
                 const a = triangleIndices[i];
                 const b = triangleIndices[i + 1];
                 const c = triangleIndices[i + 2];
 
-                appendEdge(a, b);
-                appendEdge(b, c);
-                appendEdge(c, a);
+                const baseA = a * 3;
+                const baseB = b * 3;
+                const baseC = c * 3;
+
+                const ax = geometryPositions[baseA];
+                const ay = geometryPositions[baseA + 1];
+                const az = geometryPositions[baseA + 2];
+                const bx = geometryPositions[baseB];
+                const by = geometryPositions[baseB + 1];
+                const bz = geometryPositions[baseB + 2];
+                const cx = geometryPositions[baseC];
+                const cy = geometryPositions[baseC + 1];
+                const cz = geometryPositions[baseC + 2];
+
+                const centerZ = (az + bz + cz) / 3;
+                const [r, g, bColor] = getColorForZ(centerZ);
+
+                trianglePositions.push(ax, ay, az, bx, by, bz, cx, cy, cz);
+                triangleColors.push(r, g, bColor, r, g, bColor, r, g, bColor);
+                triangleMeshIndices.push(vertexCursor, vertexCursor + 1, vertexCursor + 2);
+                vertexCursor += 3;
             }
 
-            if (!edgePositionArray.length) {
+            if (!trianglePositions.length) {
                 return null;
             }
 
-            const lineGeometry = new THREE.BufferGeometry();
-            lineGeometry.setAttribute("position", new THREE.Float32BufferAttribute(edgePositionArray, 3));
-            lineGeometry.setAttribute("color", new THREE.Float32BufferAttribute(edgeColorArray, 3));
+            const surfaceGeometry = new THREE.BufferGeometry();
+            surfaceGeometry.setAttribute("position", new THREE.Float32BufferAttribute(trianglePositions, 3));
+            surfaceGeometry.setAttribute("color", new THREE.Float32BufferAttribute(triangleColors, 3));
+            surfaceGeometry.setIndex(triangleMeshIndices);
+            surfaceGeometry.computeVertexNormals();
 
-            const lineMaterial = new THREE.LineBasicMaterial({
+            const surfaceMaterial = new THREE.MeshLambertMaterial({
                 vertexColors: true,
+                side: THREE.DoubleSide,
                 transparent: true,
-                opacity: 0.42,
+                opacity: 0.82,
+                flatShading: true,
             });
 
-            return new THREE.LineSegments(lineGeometry, lineMaterial);
+            return new THREE.Mesh(surfaceGeometry, surfaceMaterial);
         },
     };
 
@@ -845,7 +861,7 @@
         const tileMarkerMap = new Map();
         let tileMarkerGroup = null;
         let cloud = null;
-        let triangleLines = null;
+        let terrainSurface = null;
         let firstRenderable = true;
         let refreshSeq = 0;
         let refreshTimer = null;
@@ -866,6 +882,13 @@
             tileByRc.set(tileRcKey(Number(tile.tile_row), Number(tile.tile_col)), tile);
         }
 
+        /**
+         * expandTilesWithNeighborRing
+         * 主要功能: 根据种子瓦片列表，扩展包含其周围指定层数(TILE_NEIGHBOR_RING)的所有相邻瓦片。
+         * 输入参数:
+         *   - seedTiles: 核心可视瓦片列表 (array)
+         * 输出: 包含核心和相邻所有有效瓦片的列表 (array)
+         */
         const expandTilesWithNeighborRing = (seedTiles) => {
             if (!Array.isArray(seedTiles) || seedTiles.length === 0) {
                 return [];
@@ -905,6 +928,14 @@
             return expanded;
         };
 
+        /**
+         * formatTileList
+         * 主要功能: 将瓦片列表格式化为易读的 r#c# 字符串列表。
+         * 输入参数:
+         *   - tileList: 瓦片对象数组 (array)
+         *   - maxLen: 最多显示的格式化长度 (number)
+         * 输出: 格式化后的字符串 (string)
+         */
         const formatTileList = (tileList, maxLen = 12) => {
             if (!Array.isArray(tileList) || tileList.length === 0) {
                 return "none";
@@ -918,6 +949,16 @@
             return values.join(",");
         };
 
+        /**
+         * updateTileHud
+         * 主要功能: 计算并展示当前渲染和可视缓存瓦片的详细 HUD 信息（字节、数量、丢包、步长等）。
+         * 输入参数:
+         *   - visibleTiles: 当前视锥体内的瓦片 (array)
+         *   - dynamicStride: 当前使用的抽希步长 (number)
+         *   - renderedPointCount: 实际渲染的点数 (number)
+         *   - visiblePointEstimate: 原始（由元数据估算）的可视点数 (number)
+         * 输出: 无 (更新 UI)
+         */
         const updateTileHud = (visibleTiles, dynamicStride, renderedPointCount, visiblePointEstimate) => {
             const tileCount = Number(tileMeta.tile_count) || tiles.length;
             const validTotal = Number(tileMeta.valid_point_count) || 0;
@@ -986,6 +1027,12 @@
             }
         };
 
+        /**
+         * updateTileMarkerStates
+         * 主要功能: 更新瓦片中心标记辅助对象的视觉状态（颜色、透明度）。
+         * 输入参数: visibleTiles (array)
+         * 输出: 无 (副作用: 改变场景材质)
+         */
         const updateTileMarkerStates = (visibleTiles) => {
             const visibleKeys = new Set(visibleTiles.map((tile) => tileKey(tile)));
             for (let i = 0; i < tiles.length; i += 1) {
@@ -1005,6 +1052,12 @@
             }
         };
 
+        /**
+         * createTileCenterMarkers
+         * 主要功能: 为所有瓦片在场景中生成定位标记辅助对象。
+         * 输入参数: 无
+         * 输出: 无 (副作用: 向场景添加对象)
+         */
         const createTileCenterMarkers = () => {
             if (tileMarkerGroup) {
                 RenderModule.scene.remove(tileMarkerGroup);
@@ -1185,16 +1238,16 @@
             cloud = MeshModule.createWhitePointCloud(positions, colors);
             RenderModule.scene.add(cloud);
 
-            if (triangleLines) {
-                triangleLines.geometry.dispose();
-                triangleLines.material.dispose();
-                RenderModule.scene.remove(triangleLines);
-                triangleLines = null;
+            if (terrainSurface) {
+                terrainSurface.geometry.dispose();
+                terrainSurface.material.dispose();
+                RenderModule.scene.remove(terrainSurface);
+                terrainSurface = null;
             }
 
-            triangleLines = MeshModule.createColoredTriangleLines(mergedVertices, centerX, centerY, minZ, zRange, sampleStep);
-            if (triangleLines) {
-                RenderModule.scene.add(triangleLines);
+            terrainSurface = MeshModule.createIndexedSurfaceMesh(mergedVertices, centerX, centerY, minZ, zRange, sampleStep);
+            if (terrainSurface) {
+                RenderModule.scene.add(terrainSurface);
             }
 
             window.ThreeOverlayBridge = {
