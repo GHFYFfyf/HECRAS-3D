@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HEC-RAS 3D 色带+折线压测</title>
+    <style>
+        @import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap");
+
+        :root {
+            --bg: #040812;
+            --panel: rgba(8, 14, 28, 0.82);
+            --panel-border: rgba(124, 173, 255, 0.28);
+            --text: #ecf4ff;
+            --muted: #9db3d8;
+            --accent: #62d6ff;
+            --warn: #ffcc66;
+        }
+
+        html, body {
+            margin: 0;
+            width: 100%;
+            height: 100%;
+            background:
+                radial-gradient(circle at 12% 18%, rgba(59, 118, 255, 0.22) 0%, rgba(59, 118, 255, 0) 36%),
+                radial-gradient(circle at 88% 20%, rgba(98, 214, 255, 0.18) 0%, rgba(98, 214, 255, 0) 40%),
+                linear-gradient(180deg, #03060f 0%, #02040a 100%);
+            color: var(--text);
+            font-family: "Space Grotesk", "Segoe UI", sans-serif;
+            overflow: hidden;
+        }
+
+        #appRoot {
+            width: 100%;
+            height: 100%;
+            position: relative;
+        }
+
+        #sceneRoot {
+            width: 100%;
+            height: 100%;
+        }
+
+        .ui {
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+        }
+
+        .topbar {
+            position: absolute;
+            top: 14px;
+            left: 14px;
+            right: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            pointer-events: auto;
+        }
+
+        .brand {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 12px;
+            border-radius: 12px;
+            border: 1px solid var(--panel-border);
+            background: var(--panel);
+            backdrop-filter: blur(12px);
+        }
+
+        .brand strong {
+            font-size: 13px;
+            letter-spacing: 0.04em;
+        }
+
+        .brand span {
+            font-size: 11px;
+            color: var(--muted);
+            letter-spacing: 0.08em;
+        }
+
+        .top-links {
+            display: flex;
+            gap: 8px;
+        }
+
+        .top-links a {
+            text-decoration: none;
+            color: #dff3ff;
+            font-size: 12px;
+            border: 1px solid var(--panel-border);
+            background: var(--panel);
+            border-radius: 999px;
+            padding: 6px 10px;
+        }
+
+        .panel {
+            position: absolute;
+            left: 14px;
+            bottom: 14px;
+            width: min(420px, calc(100vw - 28px));
+            background: var(--panel);
+            border: 1px solid var(--panel-border);
+            border-radius: 14px;
+            backdrop-filter: blur(14px);
+            pointer-events: auto;
+            box-shadow: 0 16px 34px rgba(0, 0, 0, 0.35);
+        }
+
+        .panel-head {
+            padding: 10px 12px;
+            border-bottom: 1px solid rgba(124, 173, 255, 0.2);
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--muted);
+        }
+
+        .panel-body {
+            padding: 12px;
+            display: grid;
+            gap: 10px;
+        }
+
+        .grid2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+
+        label {
+            font-size: 12px;
+            color: var(--muted);
+            display: grid;
+            gap: 5px;
+        }
+
+        input, select {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 7px 8px;
+            border-radius: 8px;
+            border: 1px solid rgba(124, 173, 255, 0.3);
+            background: rgba(6, 10, 20, 0.85);
+            color: #eef6ff;
+            font-size: 12px;
+        }
+
+        .actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            border: 1px solid rgba(124, 173, 255, 0.35);
+            border-radius: 9px;
+            background: rgba(13, 31, 58, 0.95);
+            color: #e9f6ff;
+            font-size: 12px;
+            padding: 7px 10px;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: rgba(20, 44, 79, 0.95);
+        }
+
+        button.accent {
+            background: rgba(6, 91, 121, 0.95);
+            border-color: rgba(106, 228, 255, 0.6);
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 8px;
+        }
+
+        .stat {
+            border: 1px solid rgba(124, 173, 255, 0.22);
+            border-radius: 9px;
+            padding: 8px;
+            background: rgba(3, 8, 18, 0.74);
+        }
+
+        .stat .k {
+            font-size: 10px;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 4px;
+        }
+
+        .stat .v {
+            font-size: 14px;
+            font-weight: 700;
+        }
+
+        .note {
+            font-size: 11px;
+            color: var(--warn);
+            line-height: 1.45;
+        }
+
+        #logBox {
+            font: 11px/1.45 Menlo, Consolas, monospace;
+            color: #d5e8ff;
+            border: 1px solid rgba(124, 173, 255, 0.2);
+            border-radius: 8px;
+            background: rgba(2, 6, 14, 0.82);
+            padding: 8px;
+            max-height: 100px;
+            overflow: auto;
+            white-space: pre-wrap;
+        }
+
+        @media (max-width: 760px) {
+            .stats {
+                grid-template-columns: 1fr 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+<div id="appRoot">
+    <div id="sceneRoot"></div>
+
+    <div class="ui">
+        <div class="topbar">
+            <div class="brand">
+                <div>
+                    <strong>JSON Stress Test</strong><br>
+                    <span>COLOR BAND + POLYLINES</span>
+                </div>
+            </div>
+            <div class="top-links">
+                <a href="/">返回主页</a>
+                <a href="/three">打开三维场景</a>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-head">单包 JSON 色带+折线压测</div>
+            <div class="panel-body">
+                <div class="grid2">
+                    <label>项目
+                        <select id="projectSelect"></select>
+                    </label>
+                    <label>数据源
+                        <select id="dataModeSelect">
+                            <option value="synthetic" selected>合成 JSON（不依赖 TIF）</option>
+                            <option value="tif">项目 TIF -> JSON</option>
+                        </select>
+                    </label>
+                </div>
+
+                <div class="grid2">
+                    <label>起始目标点数
+                        <input id="startCountInput" type="number" min="10000" step="100000" value="2000000">
+                    </label>
+                    <label>点数增量步长
+                        <input id="stepCountInput" type="number" min="5000" step="100000" value="1000000">
+                    </label>
+                </div>
+
+                <div class="grid2">
+                    <label>最大目标点数
+                        <input id="maxCountInput" type="number" min="10000" step="100000" value="10000000">
+                    </label>
+                    <label>FPS 下限（判定卡顿）
+                        <input id="fpsThresholdInput" type="number" min="1" step="1" value="20">
+                    </label>
+                </div>
+
+                <div class="actions">
+                    <button id="loadBaseBtn">加载基准包（起始点数）</button>
+                    <button class="accent" id="runAutoBtn">自动阶梯压测</button>
+                    <button id="renderOnceBtn">单次拉取并渲染</button>
+                    <button id="stopBtn">停止</button>
+                </div>
+
+                <div class="stats">
+                    <div class="stat"><div class="k">当前点数</div><div class="v" id="statPointCount">--</div></div>
+                    <div class="stat"><div class="k">JSON 大小</div><div class="v" id="statJsonSize">--</div></div>
+                    <div class="stat"><div class="k">实时 FPS</div><div class="v" id="statFps">--</div></div>
+                    <div class="stat"><div class="k">稳定上限点数</div><div class="v" id="statCeiling">--</div></div>
+                    <div class="stat"><div class="k">解析耗时</div><div class="v" id="statParseMs">--</div></div>
+                    <div class="stat"><div class="k">建模耗时</div><div class="v" id="statBuildMs">--</div></div>
+                    <div class="stat"><div class="k">绘制三角形</div><div class="v" id="statRenderedPoints">--</div></div>
+                    <div class="stat"><div class="k">Draw Calls</div><div class="v" id="statDrawCalls">--</div></div>
+                </div>
+
+                <div class="note">说明：该页按你的初始方案压测：后端一次返回大 JSON，前端解析后渲染色带面+折线网。达到 FPS 下限或长耗时即判定接近卡死阈值。</div>
+                <div id="logBox"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="/assets/js/stress-points.js?v=20260322-2"></script>
+</body>
+</html>

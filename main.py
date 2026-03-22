@@ -6,7 +6,7 @@ from threading import Lock
 from time import perf_counter
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Response as FastAPIResponse
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -340,6 +340,12 @@ def three_page() -> HTMLResponse:
 	return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
+@app.get("/stress-test", response_class=HTMLResponse)
+def stress_test_page() -> HTMLResponse:
+	html_path = BASE_DIR / "templates" / "stress-test.html"
+	return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+
 @app.get("/api/projects/cards")
 def get_project_cards(
 	db: Session = Depends(get_db),
@@ -388,7 +394,7 @@ def delete_project(project_id: int, db: Session = Depends(get_db)) -> dict[str, 
 @app.get("/api/projects/{project_id}/tif-points")
 def get_project_tif_points(
 	project_id: int,
-	max_points: int = Query(default=80000, ge=1000, le=300000),
+	max_points: int = Query(default=100000, ge=1000, le=300000),
 	db: Session = Depends(get_db),
 ) -> dict[str, object]:
 	# Receive: frontend GET /api/projects/{project_id}/tif-points with project_id + max_points query.
@@ -502,13 +508,19 @@ def get_project_tif_points(
 		}
 
 
-@app.get("/api/projects/{project_id}/tif-tiles")
-def get_project_tif_tiles(
+@app.get("/api/projects/{project_id}/tif-stress-json")
+def get_project_tif_stress_json(
 	project_id: int,
-	target_points_per_tile: int = Query(default=25000, ge=10000, le=99999),
+	target_points: int = Query(default=200000, ge=10000, le=10000000),
+	include_invalid_vertices: bool = Query(default=True),
 	db: Session = Depends(get_db),
 ) -> dict[str, object]:
-	"""Return uniformly split square tile metadata and tile centers for lazy loading."""
+	"""Return a single large JSON payload for front-end stress tests.
+
+	This endpoint is intended for testing the old pipeline:
+	backend loads tif -> sends one big json -> frontend parses and renders
+	color-band surface + grid polylines in one shot.
+	"""
 	project = db.get(Project, project_id)
 	if project is None:
 		raise HTTPException(status_code=404, detail="Project not found")
@@ -521,12 +533,286 @@ def get_project_tif_tiles(
 		band = src.read(1, masked=True)
 		valid_mask = ~np.ma.getmaskarray(band)
 		valid_count = int(valid_mask.sum())
-		z_values = np.asarray(np.ma.filled(band.astype(np.float64), np.nan), dtype=np.float64)
-		z_min = float(np.nanmin(z_values)) if np.isfinite(np.nanmin(z_values)) else 0.0
-		z_max = float(np.nanmax(z_values)) if np.isfinite(np.nanmax(z_values)) else 0.0
 
 		if valid_count == 0:
 			return {
+				"project_id": project_id,
+				"target_points": int(target_points),
+				"point_count": 0,
+				"sample_count": 0,
+				"stride": 1,
+				"grid": {
+					"rows": 0,
+					"cols": 0,
+					"sample_stride": 1,
+				},
+				"metadata": {
+					"source": str(project.tif_path),
+					"crs": src.crs.to_string() if src.crs else "UNKNOWN",
+					"width": int(src.width),
+					"height": int(src.height),
+					"nodata": src.nodata,
+					"valid_point_count": 0,
+				},
+				"vertices": [],
+				"points": [],
+			}
+
+		stride = max(1, int(np.ceil(np.sqrt(valid_count / max(target_points, 1)))))
+		sampled_rows = np.arange(0, src.height, stride, dtype=np.int32)
+		sampled_cols = np.arange(0, src.width, stride, dtype=np.int32)
+
+		grid_rows, grid_cols = np.meshgrid(sampled_rows, sampled_cols, indexing="ij")
+		rows = grid_rows.ravel()
+		cols = grid_cols.ravel()
+
+		sample_row_idx, sample_col_idx = np.indices((sampled_rows.size, sampled_cols.size))
+		sample_row_flat = sample_row_idx.ravel()
+		sample_col_flat = sample_col_idx.ravel()
+
+		valid_flat = valid_mask[rows, cols]
+		sampled_band = band[rows, cols].astype(np.float64)
+		z_values = np.asarray(np.ma.filled(sampled_band, np.nan), dtype=np.float64)
+		x_vals, y_vals = rasterio.transform.xy(src.transform, rows, cols, offset="center")
+
+		if include_invalid_vertices:
+			vertices = [
+				{
+					"sample_row": int(sample_row),
+					"sample_col": int(sample_col),
+					"row": int(row),
+					"col": int(col),
+					"x": float(x),
+					"y": float(y),
+					"elevation": float(z) if bool(valid) else None,
+					"valid": bool(valid),
+				}
+				for sample_row, sample_col, row, col, x, y, z, valid in zip(
+					sample_row_flat,
+					sample_col_flat,
+					rows,
+					cols,
+					x_vals,
+					y_vals,
+					z_values,
+					valid_flat,
+					strict=False,
+				)
+			]
+		else:
+			vertices = [
+				{
+					"sample_row": int(sample_row),
+					"sample_col": int(sample_col),
+					"row": int(row),
+					"col": int(col),
+					"x": float(x),
+					"y": float(y),
+					"elevation": float(z),
+					"valid": True,
+				}
+				for sample_row, sample_col, row, col, x, y, z, valid in zip(
+					sample_row_flat,
+					sample_col_flat,
+					rows,
+					cols,
+					x_vals,
+					y_vals,
+					z_values,
+					valid_flat,
+					strict=False,
+				)
+				if bool(valid)
+			]
+
+		points = [
+			[float(x), float(y), float(z)]
+			for x, y, z, valid in zip(x_vals, y_vals, z_values, valid_flat, strict=False)
+			if bool(valid)
+		]
+
+		return {
+			"project_id": project_id,
+			"target_points": int(target_points),
+			"point_count": len(points),
+			"sample_count": int(rows.size),
+			"stride": int(stride),
+			"grid": {
+				"rows": int(sampled_rows.size),
+				"cols": int(sampled_cols.size),
+				"sample_stride": 1,
+			},
+			"metadata": {
+				"source": str(project.tif_path),
+				"crs": src.crs.to_string() if src.crs else "UNKNOWN",
+				"width": int(src.width),
+				"height": int(src.height),
+				"nodata": src.nodata,
+				"valid_point_count": valid_count,
+			},
+			"vertices": vertices,
+			"points": points,
+		}
+
+
+@app.get("/api/stress/synthetic-grid-json")
+def get_synthetic_grid_stress_json(
+	target_points: int = Query(default=200000, ge=10000, le=10000000),
+	include_invalid_vertices: bool = Query(default=True),
+) -> dict[str, object]:
+	"""Generate synthetic terrain-like JSON payload for browser stress tests.
+
+	Used to benchmark one-shot JSON transport/parse/render without TIF IO.
+	"""
+	target = int(target_points)
+	grid_cols = max(1, int(np.ceil(np.sqrt(target))))
+	grid_rows = max(1, int(np.ceil(target / grid_cols)))
+	sample_count = int(grid_rows * grid_cols)
+
+	indices = np.arange(sample_count, dtype=np.int64)
+	rows = (indices // grid_cols).astype(np.int32)
+	cols = (indices % grid_cols).astype(np.int32)
+
+	x_vals = cols.astype(np.float64)
+	y_vals = rows.astype(np.float64)
+	z_vals = (
+		8.0 * np.sin(x_vals * 0.015)
+		+ 6.0 * np.cos(y_vals * 0.013)
+		+ 0.002 * x_vals
+		+ 0.0015 * y_vals
+	).astype(np.float64)
+
+	valid_flat = np.ones(sample_count, dtype=np.uint8)
+	if sample_count > target:
+		valid_flat[target:] = 0
+
+	if include_invalid_vertices:
+		vertices = [
+			{
+				"sample_row": int(row),
+				"sample_col": int(col),
+				"row": int(row),
+				"col": int(col),
+				"x": float(x),
+				"y": float(y),
+				"elevation": float(z) if bool(valid) else None,
+				"valid": bool(valid),
+			}
+			for row, col, x, y, z, valid in zip(
+				rows,
+				cols,
+				x_vals,
+				y_vals,
+				z_vals,
+				valid_flat,
+				strict=False,
+			)
+		]
+	else:
+		vertices = [
+			{
+				"sample_row": int(row),
+				"sample_col": int(col),
+				"row": int(row),
+				"col": int(col),
+				"x": float(x),
+				"y": float(y),
+				"elevation": float(z),
+				"valid": True,
+			}
+			for row, col, x, y, z, valid in zip(
+				rows,
+				cols,
+				x_vals,
+				y_vals,
+				z_vals,
+				valid_flat,
+				strict=False,
+			)
+			if bool(valid)
+		]
+
+	points = [
+		[float(x), float(y), float(z)]
+		for x, y, z, valid in zip(x_vals, y_vals, z_vals, valid_flat, strict=False)
+		if bool(valid)
+	]
+
+	return {
+		"project_id": None,
+		"target_points": target,
+		"point_count": len(points),
+		"sample_count": sample_count,
+		"stride": 1,
+		"grid": {
+			"rows": int(grid_rows),
+			"cols": int(grid_cols),
+			"sample_stride": 1,
+		},
+		"metadata": {
+			"source": "synthetic-grid",
+			"crs": "LOCAL_SYNTHETIC",
+			"width": int(grid_cols),
+			"height": int(grid_rows),
+			"nodata": None,
+			"valid_point_count": target,
+		},
+		"vertices": vertices,
+		"points": points,
+	}
+
+
+@app.get("/api/projects/{project_id}/tif-tiles")
+def get_project_tif_tiles(
+	project_id: int,
+	target_points_per_tile: int = Query(default=25000, ge=10000, le=99999),
+	response: FastAPIResponse = None,
+	db: Session = Depends(get_db),
+) -> dict[str, object]:
+	"""Return uniformly split square tile metadata and tile centers for lazy loading."""
+	request_start = perf_counter()
+	t_read_done = request_start
+	t_mask_done = request_start
+	t_stats_done = request_start
+	t_integral_done = request_start
+	t_build_done = request_start
+
+	def _set_timing_header(final_mark: float) -> None:
+		total_ms = (final_mark - request_start) * 1000.0
+		read_ms = max(0.0, (t_read_done - request_start) * 1000.0)
+		mask_ms = max(0.0, (t_mask_done - t_read_done) * 1000.0)
+		stats_ms = max(0.0, (t_stats_done - t_mask_done) * 1000.0)
+		integral_ms = max(0.0, (t_integral_done - t_stats_done) * 1000.0)
+		build_ms = max(0.0, (t_build_done - t_integral_done) * 1000.0)
+		gen_ms = max(0.0, (t_build_done - request_start) * 1000.0)
+		if response is not None:
+			response.headers["Server-Timing"] = (
+				f"total;dur={total_ms:.2f},gen;dur={gen_ms:.2f},"
+				f"read;dur={read_ms:.2f},mask;dur={mask_ms:.2f},"
+				f"stats;dur={stats_ms:.2f},integral;dur={integral_ms:.2f},build;dur={build_ms:.2f}"
+			)
+
+	project = db.get(Project, project_id)
+	if project is None:
+		raise HTTPException(status_code=404, detail="Project not found")
+
+	tif_path = (BASE_DIR / project.tif_path).resolve()
+	if not tif_path.exists():
+		raise HTTPException(status_code=404, detail="TIF file not found")
+
+	with rasterio.open(tif_path) as src:
+		band = src.read(1, masked=True)
+		t_read_done = perf_counter()
+		valid_mask = ~np.ma.getmaskarray(band)
+		valid_count = int(valid_mask.sum())
+		t_mask_done = perf_counter()
+		z_values = np.asarray(np.ma.filled(band.astype(np.float64), np.nan), dtype=np.float64)
+		z_min = float(np.nanmin(z_values)) if np.isfinite(np.nanmin(z_values)) else 0.0
+		z_max = float(np.nanmax(z_values)) if np.isfinite(np.nanmax(z_values)) else 0.0
+		t_stats_done = perf_counter()
+
+		if valid_count == 0:
+			result = {
 				"project_id": project_id,
 				"target_points_per_tile": int(target_points_per_tile),
 				"tile_grid": {"rows": 0, "cols": 0},
@@ -548,6 +834,10 @@ def get_project_tif_tiles(
 				},
 				"tiles": [],
 			}
+			t_integral_done = t_stats_done
+			t_build_done = perf_counter()
+			_set_timing_header(perf_counter())
+			return result
 
 		tile_axis_count, tile_bounds = _build_square_tile_bounds(
 			width=int(src.width),
@@ -557,6 +847,7 @@ def get_project_tif_tiles(
 		)
 
 		integral = np.cumsum(np.cumsum(valid_mask.astype(np.int32), axis=0), axis=1)
+		t_integral_done = perf_counter()
 
 		def rect_sum(row_start: int, row_end: int, col_start: int, col_end: int) -> int:
 			total = int(integral[row_end - 1, col_end - 1])
@@ -588,7 +879,7 @@ def get_project_tif_tiles(
 				}
 			)
 
-		return {
+		result = {
 			"project_id": project_id,
 			"target_points_per_tile": int(target_points_per_tile),
 			"tile_grid": {"rows": tile_axis_count, "cols": tile_axis_count},
@@ -610,6 +901,9 @@ def get_project_tif_tiles(
 			},
 			"tiles": tiles,
 		}
+		t_build_done = perf_counter()
+		_set_timing_header(perf_counter())
+		return result
 
 
 @app.get("/api/projects/{project_id}/tif-tile-points")
@@ -620,9 +914,11 @@ def get_project_tif_tile_points(
 	col_start: int = Query(ge=0),
 	col_end: int = Query(ge=1),
 	stride: int = Query(default=1, ge=1, le=32),
+	response: FastAPIResponse = None,
 	db: Session = Depends(get_db),
 ) -> dict[str, object]:
 	"""Return points/vertices for one precomputed tile window."""
+	request_start = perf_counter()
 	project = db.get(Project, project_id)
 	if project is None:
 		raise HTTPException(status_code=404, detail="Project not found")
@@ -641,7 +937,7 @@ def get_project_tif_tile_points(
 			stride=stride,
 		)
 
-		return _build_tif_tile_points_json(
+		result = _build_tif_tile_points_json(
 			project_id=project_id,
 			row_start=row_start,
 			row_end=row_end,
@@ -650,6 +946,10 @@ def get_project_tif_tile_points(
 			stride=stride,
 			sample=sample,
 		)
+		total_ms = (perf_counter() - request_start) * 1000.0
+		if response is not None:
+			response.headers["Server-Timing"] = f"total;dur={total_ms:.2f},gen;dur={total_ms:.2f}"
+		return result
 
 
 @app.get("/api/projects/{project_id}/tif-tile-points-binary")
@@ -663,6 +963,7 @@ def get_project_tif_tile_points_binary(
 	db: Session = Depends(get_db),
 ) -> Response:
 	"""Return compact binary tile samples for faster transfer and decode."""
+	request_start = perf_counter()
 	project = db.get(Project, project_id)
 	if project is None:
 		raise HTTPException(status_code=404, detail="Project not found")
@@ -680,6 +981,7 @@ def get_project_tif_tile_points_binary(
 			col_end=col_end,
 			stride=stride,
 		)
+	t_sample_ready = perf_counter()
 
 	payload = _encode_tif_tile_points_binary(
 		project_id=project_id,
@@ -690,7 +992,18 @@ def get_project_tif_tile_points_binary(
 		stride=stride,
 		sample=sample,
 	)
-	return Response(content=payload, media_type="application/octet-stream")
+	t_payload_ready = perf_counter()
+	gen_ms = (t_payload_ready - request_start) * 1000.0
+	total_ms = gen_ms
+	sample_ms = (t_sample_ready - request_start) * 1000.0
+	encode_ms = (t_payload_ready - t_sample_ready) * 1000.0
+	return Response(
+		content=payload,
+		media_type="application/octet-stream",
+		headers={
+			"Server-Timing": f"total;dur={total_ms:.2f},gen;dur={gen_ms:.2f},sample;dur={sample_ms:.2f},encode;dur={encode_ms:.2f}",
+		},
+	)
 
 
 @app.get("/api/projects/{project_id}/hdf-water-depth")
@@ -699,6 +1012,7 @@ def get_project_hdf_water_depth(
 	time_index: int = Query(default=-1, ge=-1),
 	max_points: int = Query(default=80000, ge=1000, le=300000),
 	include_dry: bool = Query(default=False),
+	response: FastAPIResponse = None,
 	db: Session = Depends(get_db),
 ) -> dict[str, object]:
 	request_start = perf_counter()
@@ -799,8 +1113,9 @@ def get_project_hdf_water_depth(
 			"points": [],
 		}
 
-	stride = max(1, int(np.ceil(np.sqrt(valid_count / max_points))))
-	sampled_indices = valid_indices[::stride]
+	# Keep full HDF scatter points; caller confirmed count is within acceptable range.
+	stride = 1
+	sampled_indices = valid_indices
 
 	x_vals = coords[sampled_indices, 0]
 	y_vals = coords[sampled_indices, 1]
@@ -845,7 +1160,7 @@ def get_project_hdf_water_depth(
 
 	# Send: sampled [x, y, bed_z, water_z, depth] points and timeline metadata
 	# to frontend assets/js/three-hdf-overlay.js for visualization and slider state.
-	return {
+	result = {
 		"project_id": project_id,
 		"time_index": resolved_time_index,
 		"time_step_count": time_step_count,
@@ -857,5 +1172,19 @@ def get_project_hdf_water_depth(
 			"bed_elevation_ref": bed_elevation_ref,
 			"water_surface_ref": water_surface_ref,
 		},
+		"timings": {
+			"total_ms": float(total_ms),
+			"cache_ms": float(cache_ms),
+			"water_read_ms": float(water_read_ms),
+			"filter_ms": float(filter_ms),
+			"sampling_ms": float(sampling_ms),
+			"points_ms": float(points_ms),
+		},
 		"points": points,
 	}
+	if response is not None:
+		response.headers["Server-Timing"] = (
+			f"total;dur={total_ms:.2f},gen;dur={total_ms:.2f},cache;dur={cache_ms:.2f},"
+			f"water;dur={water_read_ms:.2f},filter;dur={filter_ms:.2f},sampling;dur={sampling_ms:.2f},points;dur={points_ms:.2f}"
+		)
+	return result

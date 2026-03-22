@@ -246,13 +246,24 @@
             <div class="project-chip" id="projectChip">项目 ID: --</div>
         </div>
 
-        <aside class="scene-side" aria-label="场景信息">
-            <div class="scene-side__head">导航提示</div>
+        <aside class="scene-side" aria-label="性能拆解">
+            <div class="scene-side__head">性能拆解</div>
             <div class="scene-side__body">
-                <div class="scene-side__row"><span>旋转视角</span><strong>左键拖拽</strong></div>
-                <div class="scene-side__row"><span>平移视角</span><strong>右键拖拽</strong></div>
-                <div class="scene-side__row"><span>缩放</span><strong>滚轮</strong></div>
-                <div class="scene-side__row"><span>渲染模式</span><strong>AUTO / SURFACE / POINTS</strong></div>
+                <div class="scene-side__row"><span>数据生成(后端)</span><strong id="perfDataGen">--</strong></div>
+                <div class="scene-side__row"><span>后端传输</span><strong id="perfBackendTransfer">--</strong></div>
+                <div class="scene-side__row"><span>前端拉取</span><strong id="perfFrontendFetch">--</strong></div>
+                <div class="scene-side__row"><span>前端解析</span><strong id="perfFrontendParse">--</strong></div>
+                <div class="scene-side__row"><span>前端渲染</span><strong id="perfFrontendRender">--</strong></div>
+                <div class="scene-side__row"><span>首帧可交互</span><strong id="perfTTI">--</strong></div>
+                <div class="scene-side__row"><span>TTI-页面初始化</span><strong id="perfTTIInit">--</strong></div>
+                <div class="scene-side__row"><span>TTI-项目解析</span><strong id="perfTTIProject">--</strong></div>
+                <div class="scene-side__row"><span>TTI-元数据</span><strong id="perfTTIMeta">--</strong></div>
+                <div class="scene-side__row"><span>TTI-首批瓦片</span><strong id="perfTTITiles">--</strong></div>
+                <div class="scene-side__row"><span>TTI-首帧重建</span><strong id="perfTTIRebuild">--</strong></div>
+                <div class="scene-side__row"><span>实时 FPS</span><strong id="perfRealtimeFps">--</strong></div>
+                <div class="scene-side__row"><span>Draw Calls</span><strong id="perfDrawCalls">--</strong></div>
+                <div class="scene-side__row"><span>Triangles</span><strong id="perfTriangles">--</strong></div>
+                <div class="scene-side__row"><span>最近阶段</span><strong id="perfStage">--</strong></div>
             </div>
         </aside>
     </div>
@@ -268,8 +279,8 @@
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-    <script src="/assets/js/three-empty.js?v=20260317-tiledebug"></script>
-    <script src="/assets/js/three-hdf-overlay.js?v=20260317-tiledebug"></script>
+    <script src="/assets/js/three-empty.js?v=20260322-perf-v3"></script>
+    <script src="/assets/js/three-hdf-overlay.js?v=20260322-perf-v3"></script>
     <script>
         (function () {
             const params = new URLSearchParams(window.location.search);

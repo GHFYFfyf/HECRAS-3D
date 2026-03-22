@@ -13,13 +13,46 @@
     const DEPTH_Z_LIFT_FACTOR = 0.0;
     const WATER_FORCED_Z_LIFT = 0.0;
     const MAX_POINTS_QUERY = 80000;
-    const SURFACE_GRID_MIN = 72;
-    const SURFACE_GRID_MAX = 220;
-    const SURFACE_HOLE_FILL_PASSES = 4;
-    const SURFACE_SMOOTH_PASSES = 2;
+    const SURFACE_GRID_MIN = 96;
+    const SURFACE_GRID_MAX = 320;
+    const SURFACE_GRID_MAX_HIGH_DENSITY = 220;
+    const SURFACE_HOLE_FILL_PASSES = 7;
+    const SURFACE_SMOOTH_PASSES = 3;
+    const SURFACE_HIGH_DENSITY_POINT_THRESHOLD = 60000;
     const RENDER_MODE_AUTO = "auto";
     const RENDER_MODE_SURFACE = "surface";
     const RENDER_MODE_POINTS = "points";
+
+    const perfDom = {
+        dataGen: document.getElementById("perfDataGen"),
+        backendTransfer: document.getElementById("perfBackendTransfer"),
+        frontendFetch: document.getElementById("perfFrontendFetch"),
+        frontendParse: document.getElementById("perfFrontendParse"),
+        frontendRender: document.getElementById("perfFrontendRender"),
+        stage: document.getElementById("perfStage"),
+    };
+
+    const setPerfText = (el, text) => {
+        if (el) {
+            el.textContent = text;
+        }
+    };
+
+    const formatMs = (value) => `${Number(value).toFixed(1)} ms`;
+
+    const parseServerTiming = (headerValue) => {
+        const result = { total: 0, gen: 0 };
+        const text = String(headerValue || "");
+        const totalMatch = text.match(/total;dur=([0-9.]+)/i);
+        const genMatch = text.match(/gen;dur=([0-9.]+)/i);
+        if (totalMatch) {
+            result.total = Number(totalMatch[1]) || 0;
+        }
+        if (genMatch) {
+            result.gen = Number(genMatch[1]) || 0;
+        }
+        return result;
+    };
 
     /**
      * RuntimeState
@@ -150,14 +183,30 @@
         async fetchWaterDepthPayload(projectId, timeIndex) {
             const safeTimeIndex = Number.isInteger(timeIndex) ? timeIndex : -1;
             console.log("[hdf-water-depth] request time_index", safeTimeIndex);
+            const fetchStartAt = performance.now();
             const response = await fetch(
-                `/api/projects/${encodeURIComponent(projectId)}/hdf-water-depth?time_index=${encodeURIComponent(safeTimeIndex)}&max_points=${MAX_POINTS_QUERY}&include_dry=false`,
+                `/api/projects/${encodeURIComponent(projectId)}/hdf-water-depth?time_index=${encodeURIComponent(safeTimeIndex)}&max_points=${MAX_POINTS_QUERY}&include_dry=true`,
                 { headers: { Accept: "application/json" } },
             );
             if (!response.ok) {
                 throw new Error(`Failed to load hdf water depth: HTTP ${response.status}`);
             }
-            return response.json();
+            const parseStartAt = performance.now();
+            const payload = await response.json();
+            const parseEndAt = performance.now();
+
+            const serverTiming = parseServerTiming(response.headers.get("server-timing"));
+            const fetchMs = parseStartAt - fetchStartAt;
+            const parseMs = parseEndAt - parseStartAt;
+            const backendTransferMs = Math.max(0, fetchMs - serverTiming.total);
+
+            setPerfText(perfDom.dataGen, formatMs(serverTiming.gen));
+            setPerfText(perfDom.backendTransfer, formatMs(backendTransferMs));
+            setPerfText(perfDom.frontendFetch, formatMs(fetchMs));
+            setPerfText(perfDom.frontendParse, formatMs(parseMs));
+            setPerfText(perfDom.stage, "HDF fetch/parse");
+
+            return payload;
         },
 
         /**
@@ -477,16 +526,20 @@
             const rangeX = Math.max(maxX - minX, 1e-6);
             const rangeY = Math.max(maxY - minY, 1e-6);
             const aspect = THREE.MathUtils.clamp(rangeY / rangeX, 0.35, 2.8);
+            const isHighDensity = points.length >= SURFACE_HIGH_DENSITY_POINT_THRESHOLD;
+            const gridMax = isHighDensity ? SURFACE_GRID_MAX_HIGH_DENSITY : SURFACE_GRID_MAX;
+            const holeFillPasses = isHighDensity ? Math.max(2, SURFACE_HOLE_FILL_PASSES - 3) : SURFACE_HOLE_FILL_PASSES;
+            const smoothPasses = isHighDensity ? Math.max(1, SURFACE_SMOOTH_PASSES - 1) : SURFACE_SMOOTH_PASSES;
             const baseGrid = THREE.MathUtils.clamp(
-                Math.round(Math.sqrt(points.length) * 0.72),
+                Math.round(Math.sqrt(points.length) * (isHighDensity ? 0.6 : 0.72)),
                 SURFACE_GRID_MIN,
-                SURFACE_GRID_MAX,
+                gridMax,
             );
             const gridCols = baseGrid;
             const gridRows = THREE.MathUtils.clamp(
                 Math.round(baseGrid * aspect),
                 SURFACE_GRID_MIN,
-                SURFACE_GRID_MAX,
+                gridMax,
             );
             const cellCount = gridCols * gridRows;
 
@@ -526,7 +579,7 @@
                 }
             }
 
-            for (let pass = 0; pass < SURFACE_HOLE_FILL_PASSES; pass += 1) {
+            for (let pass = 0; pass < holeFillPasses; pass += 1) {
                 const nextWater = waterGrid.slice();
                 const nextDepth = depthGrid.slice();
                 const nextValid = validGrid.slice();
@@ -574,7 +627,7 @@
                 validGrid.set(nextValid);
             }
 
-            for (let pass = 0; pass < SURFACE_SMOOTH_PASSES; pass += 1) {
+            for (let pass = 0; pass < smoothPasses; pass += 1) {
                 const nextWater = waterGrid.slice();
                 const nextDepth = depthGrid.slice();
 
@@ -651,12 +704,13 @@
                     const i10 = toIndex(row + 1, col);
                     const i01 = toIndex(row, col + 1);
                     const i11 = toIndex(row + 1, col + 1);
-                    if (!validGrid[i00] || !validGrid[i10] || !validGrid[i01] || !validGrid[i11]) {
-                        continue;
+                    // Accept per-triangle validity to avoid dropping the whole quad when only one corner is missing.
+                    if (validGrid[i00] && validGrid[i01] && validGrid[i11]) {
+                        indices.push(i00, i01, i11);
                     }
-
-                    indices.push(i00, i01, i11);
-                    indices.push(i00, i11, i10);
+                    if (validGrid[i00] && validGrid[i11] && validGrid[i10]) {
+                        indices.push(i00, i11, i10);
+                    }
                 }
             }
 
@@ -769,6 +823,7 @@
          * 输出: 无 (直接操作场景对象)
          */
         createOrUpdateWaterDepthOverlay(bridge, payload) {
+            const renderStartAt = performance.now();
             const points = Array.isArray(payload && payload.points) ? payload.points : [];
             let prepared = null;
 
@@ -812,19 +867,17 @@
                     });
                     overlay = new THREE.Points(prepared.geometry, pointMaterial);
                 } else {
-                    const meshMaterial = new THREE.MeshPhongMaterial({
+                    const meshMaterial = new THREE.MeshLambertMaterial({
                         vertexColors: true,
                         transparent: true,
                         opacity: 0.9,
-                        shininess: 26,
-                        specular: 0x223344,
                         side: THREE.DoubleSide,
                     });
                     overlay = new THREE.Mesh(prepared.geometry, meshMaterial);
                 }
                 overlay.name = "hdfWaterDepthOverlay";
                 overlay.renderOrder = 999;
-                overlay.frustumCulled = false;
+                overlay.frustumCulled = true;
                 bridge.scene.add(overlay);
                 RuntimeState.overlay = overlay;
             } else {
@@ -857,6 +910,9 @@
                 RuntimeState.marker = marker;
             }
             marker.position.set(firstX, firstY, firstZ + 1.0);
+
+            setPerfText(perfDom.frontendRender, formatMs(performance.now() - renderStartAt));
+            setPerfText(perfDom.stage, "HDF render");
         },
     };
 

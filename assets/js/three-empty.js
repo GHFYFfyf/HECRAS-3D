@@ -18,11 +18,12 @@
     const TILE_CENTER_MARKER_SIZE = 36;
     const TILE_CENTER_MARKER_Z_OFFSET = 12;
     const TILE_NEIGHBOR_RING = 1;
-    const TARGET_VIEW_POINTS = 20000;
+    const TARGET_VIEW_POINTS = 30000;
     const MAX_DYNAMIC_STRIDE = 32;
     const TILE_FETCH_CONCURRENCY = 4;
     const TIF_TILE_BINARY_MAGIC = 0x54494631;
     const TIF_TILE_BINARY_HEADER_INT32_COUNT = 11;
+    const PERFORMANCE_MAX_PIXEL_RATIO = 1.5;
 
     // Main canvas mount node. Abort early if template is not loaded as expected.
     const container = document.getElementById("threeRoot");
@@ -67,11 +68,154 @@
     const hudFetchMode = ensureHudLine("hudFetchMode", "Fetch", "--");
     const hudFetchBytes = ensureHudLine("hudFetchBytes", "Bytes", "--");
     const hudFetchPacket = ensureHudLine("hudFetchPacket", "Packet", "--");
+    const hudTimingResolve = ensureHudLine("hudTimingResolve", "T-Resolve", "--");
+    const hudTimingMetaFetch = ensureHudLine("hudTimingMetaFetch", "T-MetaFetch", "--");
+    const hudTimingMetaParse = ensureHudLine("hudTimingMetaParse", "T-MetaParse", "--");
+    const hudTimingMetaServer = ensureHudLine("hudTimingMetaServer", "T-MetaSrv", "--");
+    const hudTimingCull = ensureHudLine("hudTimingCull", "T-Cull", "--");
+    const hudTimingFetch = ensureHudLine("hudTimingFetch", "T-Fetch", "--");
+    const hudTimingRebuild = ensureHudLine("hudTimingRebuild", "T-Rebuild", "--");
+    const hudTimingUpdate = ensureHudLine("hudTimingUpdate", "T-Update", "--");
+
+    const perfDom = {
+        dataGen: document.getElementById("perfDataGen"),
+        backendTransfer: document.getElementById("perfBackendTransfer"),
+        frontendFetch: document.getElementById("perfFrontendFetch"),
+        frontendParse: document.getElementById("perfFrontendParse"),
+        frontendRender: document.getElementById("perfFrontendRender"),
+        tti: document.getElementById("perfTTI"),
+        ttiInit: document.getElementById("perfTTIInit"),
+        ttiProject: document.getElementById("perfTTIProject"),
+        ttiMeta: document.getElementById("perfTTIMeta"),
+        ttiTiles: document.getElementById("perfTTITiles"),
+        ttiRebuild: document.getElementById("perfTTIRebuild"),
+        fps: document.getElementById("perfRealtimeFps"),
+        drawCalls: document.getElementById("perfDrawCalls"),
+        triangles: document.getElementById("perfTriangles"),
+        stage: document.getElementById("perfStage"),
+    };
+
+    const pageStartAt = performance.now();
+    const perfAgg = {
+        samples: 0,
+        serverGenMs: 0,
+        serverTotalMs: 0,
+        fetchMs: 0,
+        parseMs: 0,
+    };
+    const phaseAgg = {
+        updateSamples: 0,
+        resolveMs: 0,
+        metaFetchMs: 0,
+        metaParseMs: 0,
+        metaServerBreakdown: "--",
+        collectVisibleMsSum: 0,
+        fetchTilesMsSum: 0,
+        rebuildMsSum: 0,
+        updateTotalMsSum: 0,
+    };
+
+    const setPerfText = (el, text) => {
+        if (el) {
+            el.textContent = text;
+        }
+    };
+
+    const formatMs = (value) => `${Number(value).toFixed(1)} ms`;
+
+    const parseServerTiming = (headerValue) => {
+        const result = { total: 0, gen: 0, metrics: {} };
+        const text = String(headerValue || "");
+        if (!text) {
+            return result;
+        }
+        const entries = text.split(",");
+        for (let i = 0; i < entries.length; i += 1) {
+            const entry = entries[i].trim();
+            if (!entry) {
+                continue;
+            }
+            const nameMatch = entry.match(/^([^;\s,]+)/);
+            const durMatch = entry.match(/dur=([0-9.]+)/i);
+            if (!nameMatch || !durMatch) {
+                continue;
+            }
+            const metricName = String(nameMatch[1] || "").toLowerCase();
+            const durationMs = Number(durMatch[1]) || 0;
+            result.metrics[metricName] = durationMs;
+        }
+        result.total = Number(result.metrics.total) || 0;
+        result.gen = Number(result.metrics.gen) || 0;
+        return result;
+    };
+
+    const updatePhaseHud = () => {
+        const n = Math.max(phaseAgg.updateSamples, 1);
+        setPerfText(hudTimingResolve, phaseAgg.resolveMs > 0 ? formatMs(phaseAgg.resolveMs) : "--");
+        setPerfText(hudTimingMetaFetch, phaseAgg.metaFetchMs > 0 ? formatMs(phaseAgg.metaFetchMs) : "--");
+        setPerfText(hudTimingMetaParse, phaseAgg.metaParseMs > 0 ? formatMs(phaseAgg.metaParseMs) : "--");
+        setPerfText(hudTimingMetaServer, phaseAgg.metaServerBreakdown || "--");
+        setPerfText(hudTimingCull, formatMs(phaseAgg.collectVisibleMsSum / n));
+        setPerfText(hudTimingFetch, formatMs(phaseAgg.fetchTilesMsSum / n));
+        setPerfText(hudTimingRebuild, formatMs(phaseAgg.rebuildMsSum / n));
+        setPerfText(hudTimingUpdate, formatMs(phaseAgg.updateTotalMsSum / n));
+    };
+
+    const recordMetaTiming = (timing) => {
+        if (!timing) {
+            return;
+        }
+        phaseAgg.metaFetchMs = Number(timing.fetchMs) || 0;
+        phaseAgg.metaParseMs = Number(timing.parseMs) || 0;
+        const metricNames = ["read", "mask", "stats", "integral", "build", "gen"];
+        const parts = [];
+        for (let i = 0; i < metricNames.length; i += 1) {
+            const name = metricNames[i];
+            const value = Number(timing.serverMetrics?.[name]);
+            if (Number.isFinite(value) && value > 0) {
+                parts.push(`${name}:${value.toFixed(1)}`);
+            }
+        }
+        phaseAgg.metaServerBreakdown = parts.length ? parts.join(" ") : "--";
+        updatePhaseHud();
+    };
+
+    const recordTileUpdateTiming = (timing) => {
+        phaseAgg.updateSamples += 1;
+        phaseAgg.collectVisibleMsSum += Number(timing.collectVisibleMs) || 0;
+        phaseAgg.fetchTilesMsSum += Number(timing.fetchTilesMs) || 0;
+        phaseAgg.rebuildMsSum += Number(timing.rebuildMs) || 0;
+        phaseAgg.updateTotalMsSum += Number(timing.totalMs) || 0;
+        updatePhaseHud();
+    };
+
+    const updatePerfFromFetch = (timing, stage) => {
+        perfAgg.samples += 1;
+        perfAgg.serverGenMs += timing.serverGenMs;
+        perfAgg.serverTotalMs += timing.serverTotalMs;
+        perfAgg.fetchMs += timing.fetchMs;
+        perfAgg.parseMs += timing.parseMs;
+
+        const n = Math.max(perfAgg.samples, 1);
+        const avgGen = perfAgg.serverGenMs / n;
+        const avgTotal = perfAgg.serverTotalMs / n;
+        const avgFetch = perfAgg.fetchMs / n;
+        const avgParse = perfAgg.parseMs / n;
+        const avgBackendTransfer = Math.max(0, avgFetch - avgTotal);
+
+        setPerfText(perfDom.dataGen, formatMs(avgGen));
+        setPerfText(perfDom.backendTransfer, formatMs(avgBackendTransfer));
+        setPerfText(perfDom.frontendFetch, formatMs(avgFetch));
+        setPerfText(perfDom.frontendParse, formatMs(avgParse));
+        setPerfText(perfDom.stage, stage);
+    };
 
     // URL state: /three?project_id=... .
     const params = new URLSearchParams(window.location.search);
     let projectId = params.get("project_id");
     const DEBUG_FETCH_LOG = params.get("debug_fetch") === "1";
+    const SHOW_TILE_MARKERS = params.get("show_tile_markers") === "1";
+    const SHOW_BASE_POINT_CLOUD = params.get("show_base_points") === "1";
     const DEBUG_BINARY_PREVIEW_BYTES = 64;
     let hasLoggedBinarySample = false;
     let hasLoggedJsonFallback = false;
@@ -120,13 +264,27 @@
          * Output: Promise<{tiles, tile_grid, metadata, ...}>.
          */
         async fetchTifTilesMeta(resolvedProjectId) {
+            const requestStart = performance.now();
             const response = await fetch(
                 `/api/projects/${encodeURIComponent(resolvedProjectId)}/tif-tiles?target_points_per_tile=${TILE_TARGET_POINTS}`,
             );
+            const fetchDone = performance.now();
             if (!response.ok) {
                 throw new Error(`Failed to load tif tile metadata: HTTP ${response.status}`);
             }
-            return response.json();
+            const parseStart = performance.now();
+            const payload = await response.json();
+            const parseDone = performance.now();
+            const serverTiming = parseServerTiming(response.headers.get("server-timing"));
+            payload._meta_timing = {
+                serverGenMs: serverTiming.gen,
+                serverTotalMs: serverTiming.total,
+                serverMetrics: serverTiming.metrics,
+                fetchMs: fetchDone - requestStart,
+                parseMs: parseDone - parseStart,
+                totalMs: parseDone - requestStart,
+            };
+            return payload;
         },
 
         /**
@@ -136,6 +294,7 @@
          * Output: Promise<{points, vertices, ...}>.
          */
         async fetchTifTilePayload(resolvedProjectId, tile, stride = 1) {
+            const requestStart = performance.now();
             const query = new URLSearchParams({
                 row_start: String(tile.row_start),
                 row_end: String(tile.row_end),
@@ -152,17 +311,41 @@
 
             if (binaryResponse.ok) {
                 const contentType = String(binaryResponse.headers.get("content-type") || "").toLowerCase();
+                const serverTiming = parseServerTiming(binaryResponse.headers.get("server-timing"));
                 if (contentType.includes("application/octet-stream")) {
                     const buffer = await binaryResponse.arrayBuffer();
+                    const fetchDone = performance.now();
+                    const parseStart = performance.now();
                     const payload = this.parseTifTileBinaryPayload(buffer);
+                    const parseDone = performance.now();
                     payload._transport = "binary";
                     payload._transport_bytes = buffer.byteLength;
                     payload._transport_content_type = contentType;
+                    updatePerfFromFetch(
+                        {
+                            serverGenMs: serverTiming.gen,
+                            serverTotalMs: serverTiming.total,
+                            fetchMs: fetchDone - requestStart,
+                            parseMs: parseDone - parseStart,
+                        },
+                        "Terrain tile(binary)",
+                    );
                     return payload;
                 }
+                const parseStart = performance.now();
                 const payload = await binaryResponse.json();
+                const parseDone = performance.now();
                 payload._transport = "binary-endpoint-json";
                 payload._transport_content_type = contentType;
+                updatePerfFromFetch(
+                    {
+                        serverGenMs: serverTiming.gen,
+                        serverTotalMs: serverTiming.total,
+                        fetchMs: parseStart - requestStart,
+                        parseMs: parseDone - parseStart,
+                    },
+                    "Terrain tile(json)",
+                );
                 return payload;
             }
 
@@ -175,10 +358,22 @@
             if (!legacyResponse.ok) {
                 throw new Error(`Failed to load tif tile points: HTTP ${legacyResponse.status}`);
             }
+            const parseStart = performance.now();
             const payload = await legacyResponse.json();
+            const parseDone = performance.now();
+            const serverTiming = parseServerTiming(legacyResponse.headers.get("server-timing"));
             payload._transport = "json-fallback";
             payload._transport_content_type = "application/json";
             payload._transport_fallback_reason = `binary status ${binaryResponse.status}`;
+            updatePerfFromFetch(
+                {
+                    serverGenMs: serverTiming.gen,
+                    serverTotalMs: serverTiming.total,
+                    fetchMs: parseStart - requestStart,
+                    parseMs: parseDone - parseStart,
+                },
+                "Terrain tile(fallback)",
+            );
             if (DEBUG_FETCH_LOG || !hasLoggedJsonFallback) {
                 console.warn("[tif-tile-fetch] fallback to JSON", {
                     reason: payload._transport_fallback_reason,
@@ -698,7 +893,7 @@
             this.camera.position.set(0, 20, 60);
 
             this.renderer = new THREE.WebGLRenderer({ antialias: true });
-            this.renderer.setPixelRatio(window.devicePixelRatio || 1);
+            this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, PERFORMANCE_MAX_PIXEL_RATIO));
             this.renderer.setSize(window.innerWidth, window.innerHeight);
             container.appendChild(this.renderer.domElement);
 
@@ -785,6 +980,9 @@
                 if (hudFps) {
                     hudFps.textContent = fps.toFixed(1);
                 }
+                setPerfText(perfDom.fps, fps.toFixed(1));
+                setPerfText(perfDom.drawCalls, String(this.renderer.info.render.calls || 0));
+                setPerfText(perfDom.triangles, String(this.renderer.info.render.triangles || 0));
                 this.fpsElapsedMs = 0;
                 this.fpsFrameCount = 0;
             }
@@ -808,7 +1006,14 @@
      */
     async function bootstrap() {
         const loadStartAt = performance.now();
+        const ttiMarks = {
+            start: loadStartAt,
+            afterInit: loadStartAt,
+            afterResolveProject: loadStartAt,
+            afterMeta: loadStartAt,
+        };
         RenderModule.init();
+        ttiMarks.afterInit = performance.now();
 
         window.ThreeOverlayBridge = {
             scene: RenderModule.scene,
@@ -823,8 +1028,14 @@
             zRange: 1,
         };
 
+        const resolveStartAt = performance.now();
         projectId = await DataModule.resolveProjectId(projectId, params);
+        phaseAgg.resolveMs = performance.now() - resolveStartAt;
+        updatePhaseHud();
+        ttiMarks.afterResolveProject = performance.now();
         const tileMeta = await DataModule.fetchTifTilesMeta(projectId);
+        recordMetaTiming(tileMeta._meta_timing);
+        ttiMarks.afterMeta = performance.now();
         DataModule.logTileMetaSummary(tileMeta);
 
         const tiles = Array.isArray(tileMeta.tiles) ? tileMeta.tiles : [];
@@ -1034,6 +1245,9 @@
          * 输出: 无 (副作用: 改变场景材质)
          */
         const updateTileMarkerStates = (visibleTiles) => {
+            if (!SHOW_TILE_MARKERS) {
+                return;
+            }
             const visibleKeys = new Set(visibleTiles.map((tile) => tileKey(tile)));
             for (let i = 0; i < tiles.length; i += 1) {
                 const tile = tiles[i];
@@ -1182,6 +1396,7 @@
         };
 
         const rebuildSceneFromVisibleTiles = (visibleTiles, sampleStep) => {
+            const renderStartAt = performance.now();
             const uniqueVertexByKey = new Map();
 
             for (let i = 0; i < visibleTiles.length; i += 1) {
@@ -1235,8 +1450,10 @@
                 RenderModule.scene.remove(cloud);
                 cloud = null;
             }
-            cloud = MeshModule.createWhitePointCloud(positions, colors);
-            RenderModule.scene.add(cloud);
+            if (SHOW_BASE_POINT_CLOUD) {
+                cloud = MeshModule.createWhitePointCloud(positions, colors);
+                RenderModule.scene.add(cloud);
+            }
 
             if (terrainSurface) {
                 terrainSurface.geometry.dispose();
@@ -1269,11 +1486,14 @@
                         detail: window.ThreeOverlayBridge,
                     }),
                 );
+                setPerfText(perfDom.tti, formatMs(performance.now() - pageStartAt));
                 firstRenderable = false;
             }
 
             const elapsedMs = performance.now() - loadStartAt;
             RenderModule.setLoadHudText(`${elapsedMs.toFixed(1)} ms | tiles ${visibleTiles.length}`);
+            setPerfText(perfDom.frontendRender, formatMs(performance.now() - renderStartAt));
+            setPerfText(perfDom.stage, "Terrain rebuild");
             return mergedPoints.length;
         };
 
@@ -1297,17 +1517,23 @@
         };
 
         const updateVisibleTiles = async (options = {}) => {
+            const updateStartAt = performance.now();
             const skipRebuild = Boolean(options.skipRebuild);
             const requestId = refreshSeq + 1;
             refreshSeq = requestId;
 
+            const collectVisibleStartAt = performance.now();
             const { seedTiles, renderTiles } = collectVisibleTiles();
-            const visibleTiles = renderTiles;
+            const collectVisibleMs = performance.now() - collectVisibleStartAt;
+            const useSeedOnlyNoThinning = seedTiles.length <= 4;
+            const visibleTiles = useSeedOnlyNoThinning ? seedTiles : renderTiles;
             const visiblePointEstimate = seedTiles.reduce((acc, tile) => acc + (Number(tile.point_count) || 0), 0);
-            const dynamicStride = Math.max(
-                1,
-                Math.min(MAX_DYNAMIC_STRIDE, Math.ceil(Math.max(visiblePointEstimate, 1) / TARGET_VIEW_POINTS)),
-            );
+            const dynamicStride = useSeedOnlyNoThinning
+                ? 1
+                : Math.max(
+                    1,
+                    Math.min(MAX_DYNAMIC_STRIDE, Math.ceil(Math.max(visiblePointEstimate, 1) / TARGET_VIEW_POINTS)),
+                );
             const taskFactories = [];
             for (let i = 0; i < visibleTiles.length; i += 1) {
                 const tile = visibleTiles[i];
@@ -1324,7 +1550,11 @@
             }
 
             if (taskFactories.length) {
+                const fetchTilesStartAt = performance.now();
                 await runWithConcurrency(taskFactories, TILE_FETCH_CONCURRENCY);
+                var fetchTilesMs = performance.now() - fetchTilesStartAt;
+            } else {
+                var fetchTilesMs = 0;
             }
 
             if (requestId !== refreshSeq) {
@@ -1332,6 +1562,7 @@
             }
 
             let renderedPointCount = 0;
+            let rebuildMs = 0;
             if (skipRebuild) {
                 for (let i = 0; i < visibleTiles.length; i += 1) {
                     const cached = tileCache.get(tileKey(visibleTiles[i]));
@@ -1341,10 +1572,25 @@
                     renderedPointCount += cached.points.length;
                 }
             } else {
+                const rebuildStartAt = performance.now();
                 renderedPointCount = rebuildSceneFromVisibleTiles(visibleTiles, dynamicStride);
+                rebuildMs = performance.now() - rebuildStartAt;
             }
             updateTileMarkerStates(visibleTiles);
             updateTileHud(visibleTiles, dynamicStride, renderedPointCount, visiblePointEstimate);
+            const totalMs = performance.now() - updateStartAt;
+            recordTileUpdateTiming({
+                collectVisibleMs,
+                fetchTilesMs,
+                rebuildMs,
+                totalMs,
+            });
+            return {
+                collectVisibleMs,
+                fetchTilesMs,
+                rebuildMs,
+                totalMs,
+            };
         };
 
         const queueVisibleRefresh = (options = {}) => {
@@ -1378,9 +1624,16 @@
             void drain();
         };
 
-        createTileCenterMarkers();
+        if (SHOW_TILE_MARKERS) {
+            createTileCenterMarkers();
+        }
 
-        await updateVisibleTiles();
+        const firstUpdateTiming = await updateVisibleTiles();
+        setPerfText(perfDom.ttiInit, formatMs(ttiMarks.afterInit - ttiMarks.start));
+        setPerfText(perfDom.ttiProject, formatMs(ttiMarks.afterResolveProject - ttiMarks.afterInit));
+        setPerfText(perfDom.ttiMeta, formatMs(ttiMarks.afterMeta - ttiMarks.afterResolveProject));
+        setPerfText(perfDom.ttiTiles, formatMs(firstUpdateTiming.fetchTilesMs || 0));
+        setPerfText(perfDom.ttiRebuild, formatMs(firstUpdateTiming.rebuildMs || 0));
 
         const scheduleRefresh = (delayMs, options = {}) => {
             const skipRebuild = Boolean(options.skipRebuild);
