@@ -16,7 +16,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     const mercatorProjection = new Cesium.WebMercatorProjection();
 
     // Grant CesiumJS access to your ion assets
-    Cesium.Ion.defaultAccessToken = "your token here";
+    Cesium.Ion.defaultAccessToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiIwMjc0YjQ0MS0wOTliLTQ3ZGQtYmZhMi05YTdlYTM5MWUyYmUiLCJpZCI6MzQ5Mjk1LCJpYXQiOjE3NjExODM2Njl9.xKRoBHBK6rfDy85asmx50omBvFw96N48Vq0Z85U9hys";
 
     // Initialize Cesium Viewer
     let viewer;

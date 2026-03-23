@@ -15,6 +15,7 @@
     const TILE_VISIBLE_UPDATE_DEBOUNCE_MS = 40;
     const TILE_INTERACT_UPDATE_DEBOUNCE_MS = 80;
     const TILE_WHEEL_END_DELAY_MS = 120;
+    const TILE_STATIC_REBUILD_DELAY_MS = 80;
     const TILE_CENTER_MARKER_SIZE = 36;
     const TILE_CENTER_MARKER_Z_OFFSET = 12;
     const TILE_NEIGHBOR_RING = 1;
@@ -1076,6 +1077,7 @@
         let firstRenderable = true;
         let refreshSeq = 0;
         let refreshTimer = null;
+        let staticRebuildTimer = null;
         let scheduledNeedsRebuild = false;
         let refreshInFlight = false;
         let refreshQueued = false;
@@ -1100,10 +1102,11 @@
          *   - seedTiles: 核心可视瓦片列表 (array)
          * 输出: 包含核心和相邻所有有效瓦片的列表 (array)
          */
-        const expandTilesWithNeighborRing = (seedTiles) => {
+        const expandTilesWithNeighborRing = (seedTiles, ringDepth = TILE_NEIGHBOR_RING) => {
             if (!Array.isArray(seedTiles) || seedTiles.length === 0) {
                 return [];
             }
+            const safeRingDepth = Math.max(0, Math.trunc(ringDepth) || 0);
             const expanded = [];
             const seen = new Set();
 
@@ -1115,8 +1118,8 @@
                     continue;
                 }
 
-                for (let dr = -TILE_NEIGHBOR_RING; dr <= TILE_NEIGHBOR_RING; dr += 1) {
-                    for (let dc = -TILE_NEIGHBOR_RING; dc <= TILE_NEIGHBOR_RING; dc += 1) {
+                for (let dr = -safeRingDepth; dr <= safeRingDepth; dr += 1) {
+                    for (let dc = -safeRingDepth; dc <= safeRingDepth; dc += 1) {
                         const nr = seedRow + dr;
                         const nc = seedCol + dc;
                         if (nr < 0 || nr >= tileGridRows || nc < 0 || nc >= tileGridCols) {
@@ -1363,7 +1366,7 @@
                 const seedTiles = visibleSeeds.map((entry) => entry.tile);
                 return {
                     seedTiles,
-                    renderTiles: expandTilesWithNeighborRing(seedTiles),
+                    renderTiles: expandTilesWithNeighborRing(seedTiles, TILE_NEIGHBOR_RING),
                 };
             }
 
@@ -1391,7 +1394,7 @@
 
             return {
                 seedTiles: [nearest],
-                renderTiles: expandTilesWithNeighborRing([nearest]),
+                renderTiles: expandTilesWithNeighborRing([nearest], TILE_NEIGHBOR_RING),
             };
         };
 
@@ -1525,14 +1528,14 @@
             const collectVisibleStartAt = performance.now();
             const { seedTiles, renderTiles } = collectVisibleTiles();
             const collectVisibleMs = performance.now() - collectVisibleStartAt;
-            const useSeedOnlyNoThinning = seedTiles.length <= 4;
-            const visibleTiles = useSeedOnlyNoThinning ? seedTiles : renderTiles;
+            const visibleTiles = renderTiles;
             const visiblePointEstimate = seedTiles.reduce((acc, tile) => acc + (Number(tile.point_count) || 0), 0);
-            const dynamicStride = useSeedOnlyNoThinning
+            const forceStrideOne = seedTiles.length === 1;
+            const dynamicStride = forceStrideOne
                 ? 1
                 : Math.max(
                     1,
-                    Math.min(MAX_DYNAMIC_STRIDE, Math.ceil(Math.max(visiblePointEstimate, 1) / TARGET_VIEW_POINTS)),
+                    Math.min(MAX_DYNAMIC_STRIDE, Math.floor(Math.max(visiblePointEstimate, 1) / TARGET_VIEW_POINTS)),
                 );
             const taskFactories = [];
             for (let i = 0; i < visibleTiles.length; i += 1) {
@@ -1651,6 +1654,16 @@
             }, delayMs);
         };
 
+        const scheduleStableRebuild = (delayMs = TILE_STATIC_REBUILD_DELAY_MS) => {
+            if (staticRebuildTimer) {
+                window.clearTimeout(staticRebuildTimer);
+            }
+            staticRebuildTimer = window.setTimeout(() => {
+                staticRebuildTimer = null;
+                queueVisibleRefresh();
+            }, delayMs);
+        };
+
         RenderModule.renderer.domElement.addEventListener("wheel", () => {
             lastInteractionType = "wheel";
         }, { passive: true });
@@ -1671,27 +1684,34 @@
                 window.clearTimeout(refreshTimer);
                 refreshTimer = null;
             }
+            if (staticRebuildTimer) {
+                window.clearTimeout(staticRebuildTimer);
+                staticRebuildTimer = null;
+            }
         });
 
         RenderModule.controls.addEventListener("change", () => {
-            // Avoid heavy refresh storm while user is actively dragging/zooming.
-            if (controlsInteracting) {
-                scheduleRefresh(TILE_INTERACT_UPDATE_DEBOUNCE_MS, { skipRebuild: true });
-                return;
-            }
-            scheduleRefresh(TILE_VISIBLE_UPDATE_DEBOUNCE_MS);
+            const lightDelayMs = controlsInteracting
+                ? TILE_INTERACT_UPDATE_DEBOUNCE_MS
+                : TILE_VISIBLE_UPDATE_DEBOUNCE_MS;
+            // Keep interaction smooth: update visibility/cache without rebuilding mesh.
+            scheduleRefresh(lightDelayMs, { skipRebuild: true });
+            // Run one heavy rebuild only after camera settles.
+            scheduleStableRebuild();
         });
 
         RenderModule.controls.addEventListener("end", () => {
             controlsInteracting = false;
             if (lastInteractionType === "wheel") {
-                // Wheel emits dense events; delay refresh slightly to avoid per-notch stalls.
-                scheduleRefresh(TILE_WHEEL_END_DELAY_MS);
+                // Wheel emits dense events; keep lightweight updates and postpone heavy rebuild.
+                scheduleRefresh(TILE_WHEEL_END_DELAY_MS, { skipRebuild: true });
+                scheduleStableRebuild(TILE_WHEEL_END_DELAY_MS + TILE_STATIC_REBUILD_DELAY_MS);
                 lastInteractionType = "unknown";
                 return;
             }
             lastInteractionType = "unknown";
-            queueVisibleRefresh();
+            scheduleRefresh(TILE_VISIBLE_UPDATE_DEBOUNCE_MS, { skipRebuild: true });
+            scheduleStableRebuild();
         });
     }
 
