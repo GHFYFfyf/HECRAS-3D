@@ -27,7 +27,7 @@
         logBox: document.getElementById("logBox"),
     };
 
-    const RUN_RECORDS_STORAGE_KEY = "baselineStressRunRecords.v1";
+    const RUN_RECORDS_STORAGE_KEY = "baselineStressRunRecords.v2";
 
     const state = {
         scene: null,

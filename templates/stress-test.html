@@ -205,6 +205,18 @@
             line-height: 1.45;
         }
 
+        .recorder-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .recorder-hint {
+            font-size: 11px;
+            color: #93b9df;
+        }
+
         #logBox {
             font: 11px/1.45 Menlo, Consolas, monospace;
             color: #d5e8ff;
@@ -294,6 +306,13 @@
                 </div>
 
                 <div class="note">说明：该页按你的初始方案压测：后端一次返回大 JSON，前端解析后渲染色带面+折线网。达到 FPS 下限或长耗时即判定接近卡死阈值。</div>
+
+                <div class="recorder-row">
+                    <button id="exportCsvBtn">导出实验 CSV</button>
+                    <button id="clearRecordsBtn">清空实验记录</button>
+                    <span class="recorder-hint">已记录 <strong id="recordCountText">0</strong> 条自动压测结果（仅本浏览器）</span>
+                </div>
+
                 <div id="logBox"></div>
             </div>
         </div>
@@ -302,6 +321,6 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-<script src="/assets/js/stress-points.js?v=20260322-2"></script>
+<script src="/assets/js/stress-points.js?v=20260323-3"></script>
 </body>
 </html>
