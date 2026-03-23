@@ -21,8 +21,13 @@
         statBuildMs: document.getElementById("statBuildMs"),
         statRenderedPoints: document.getElementById("statRenderedPoints"),
         statDrawCalls: document.getElementById("statDrawCalls"),
+        exportCsvBtn: document.getElementById("exportCsvBtn"),
+        clearRecordsBtn: document.getElementById("clearRecordsBtn"),
+        recordCountText: document.getElementById("recordCountText"),
         logBox: document.getElementById("logBox"),
     };
+
+    const RUN_RECORDS_STORAGE_KEY = "baselineStressRunRecords.v1";
 
     const state = {
         scene: null,
@@ -47,7 +52,173 @@
         lastDrawCalls: 0,
         knownValidPointCount: 0,
         lastStride: 0,
+        runRecords: [],
     };
+
+    function safeNumber(value, fallback = 0) {
+        const n = Number(value);
+        return Number.isFinite(n) ? n : fallback;
+    }
+
+    function loadRunRecords() {
+        try {
+            const raw = window.localStorage.getItem(RUN_RECORDS_STORAGE_KEY);
+            if (!raw) {
+                return [];
+            }
+            const parsed = JSON.parse(raw);
+            if (!Array.isArray(parsed)) {
+                return [];
+            }
+            return parsed.filter((item) => item && typeof item === "object");
+        } catch (_error) {
+            return [];
+        }
+    }
+
+    function saveRunRecords() {
+        try {
+            window.localStorage.setItem(RUN_RECORDS_STORAGE_KEY, JSON.stringify(state.runRecords));
+        } catch (_error) {
+            logLine("警告: 无法写入本地实验记录（可能是浏览器存储限制）");
+        }
+    }
+
+    function updateRecordCountUi() {
+        if (dom.recordCountText) {
+            dom.recordCountText.textContent = String(state.runRecords.length);
+        }
+    }
+
+    function csvEscape(value) {
+        const text = String(value ?? "");
+        if (!/[",\n\r]/.test(text)) {
+            return text;
+        }
+        return `"${text.replace(/"/g, '""')}"`;
+    }
+
+    function toCsvText(records) {
+        const headers = [
+            "record_id",
+            "timestamp",
+            "record_kind",
+            "run_id",
+            "step_index",
+            "mode",
+            "project_id",
+            "start_count",
+            "step_count",
+            "max_count",
+            "fps_threshold",
+            "target_count",
+            "actual_count",
+            "json_bytes",
+            "predicted_stride",
+            "stride",
+            "fps",
+            "parse_ms",
+            "build_ms",
+            "total_ms",
+            "threshold_hit",
+            "threshold_reason",
+            "skip_reason",
+            "stable_count",
+            "stable_json_bytes",
+            "stop_fps",
+            "stop_parse_ms",
+            "stop_build_ms",
+            "stop_total_ms",
+            "stop_reason",
+            "tested_steps",
+            "skipped_steps",
+            "run_duration_ms",
+        ];
+        const lines = [headers.join(",")];
+        for (let i = 0; i < records.length; i += 1) {
+            const r = records[i] || {};
+            const row = [
+                r.record_id,
+                r.timestamp,
+                r.record_kind || "summary",
+                r.run_id,
+                r.step_index,
+                r.mode,
+                r.project_id,
+                r.start_count,
+                r.step_count,
+                r.max_count,
+                r.fps_threshold,
+                r.target_count,
+                r.actual_count,
+                r.json_bytes,
+                r.predicted_stride,
+                r.stride,
+                Number.isFinite(Number(r.fps)) ? Number(r.fps).toFixed(2) : "",
+                Number.isFinite(Number(r.parse_ms)) ? Number(r.parse_ms).toFixed(2) : "",
+                Number.isFinite(Number(r.build_ms)) ? Number(r.build_ms).toFixed(2) : "",
+                Number.isFinite(Number(r.total_ms)) ? Number(r.total_ms).toFixed(2) : "",
+                r.threshold_hit,
+                r.threshold_reason,
+                r.skip_reason,
+                r.stable_count,
+                r.stable_json_bytes,
+                Number.isFinite(Number(r.stop_fps)) ? Number(r.stop_fps).toFixed(2) : "",
+                Number.isFinite(Number(r.stop_parse_ms)) ? Number(r.stop_parse_ms).toFixed(2) : "",
+                Number.isFinite(Number(r.stop_build_ms)) ? Number(r.stop_build_ms).toFixed(2) : "",
+                Number.isFinite(Number(r.stop_total_ms)) ? Number(r.stop_total_ms).toFixed(2) : "",
+                r.stop_reason,
+                r.tested_steps,
+                r.skipped_steps,
+                Number.isFinite(Number(r.run_duration_ms)) ? Number(r.run_duration_ms).toFixed(2) : "",
+            ].map(csvEscape);
+            lines.push(row.join(","));
+        }
+        return `${lines.join("\n")}\n`;
+    }
+
+    function downloadCsv() {
+        if (!state.runRecords.length) {
+            logLine("暂无实验记录，先运行一次自动阶梯压测");
+            return;
+        }
+        const csvText = toCsvText(state.runRecords);
+        const blob = new Blob([csvText], { type: "text/csv;charset=utf-8;" });
+        const anchor = document.createElement("a");
+        const now = new Date();
+        const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}_${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}${String(now.getSeconds()).padStart(2, "0")}`;
+        anchor.href = URL.createObjectURL(blob);
+        anchor.download = `baseline_stress_runs_${stamp}.csv`;
+        document.body.appendChild(anchor);
+        anchor.click();
+        document.body.removeChild(anchor);
+        URL.revokeObjectURL(anchor.href);
+        logLine(`CSV 已导出: ${state.runRecords.length} 条记录`);
+    }
+
+    function clearRunRecords() {
+        state.runRecords = [];
+        saveRunRecords();
+        updateRecordCountUi();
+        logLine("已清空本浏览器中的实验记录");
+    }
+
+    function appendRunRecord(payload) {
+        const nextId = state.runRecords.length + 1;
+        state.runRecords.push({
+            record_id: nextId,
+            ...payload,
+        });
+        saveRunRecords();
+        updateRecordCountUi();
+    }
+
+    function buildRunId(mode, projectId) {
+        const safeMode = String(mode || "unknown").trim() || "unknown";
+        const safeProjectId = String(projectId || "unknown").trim() || "unknown";
+        const randomPart = Math.random().toString(36).slice(2, 8);
+        return `${safeMode}-${safeProjectId}-${Date.now()}-${randomPart}`;
+    }
 
     const ELEVATION_COLOR_GRADIENT = [
         { t: 0.0, color: [18, 42, 120] },
@@ -453,6 +624,10 @@
         const maxCount = clampInt(dom.maxCountInput.value, 10000000, 10000, 10000000);
         const fpsThreshold = clampInt(dom.fpsThresholdInput.value, 20, 1, 240);
         const mode = getDataMode();
+        const projectId = mode === "tif" ? String(dom.projectSelect.value || "") : "synthetic";
+        const runStartedAt = performance.now();
+        const runTimestamp = new Date().toISOString();
+        const runId = buildRunId(mode, projectId);
 
         state.running = true;
         state.runToken += 1;
@@ -465,10 +640,16 @@
         let testedSteps = 0;
         let skippedSteps = 0;
         let prevPredictedStride = 0;
+        let stopFps = 0;
+        let stopParseMs = 0;
+        let stopBuildMs = 0;
+        let stopTotalMs = 0;
+        let loopIndex = 0;
 
         logLine(`开始自动压测: start=${startCount}, step=${stepCount}, max=${maxCount}, fpsFloor=${fpsThreshold}`);
 
         for (let target = startCount; target <= maxCount; target += stepCount) {
+            loopIndex += 1;
             if (!state.running || token !== state.runToken) {
                 stopReason = "手动停止";
                 break;
@@ -483,6 +664,21 @@
                     updateStats();
                 }
                 logLine(`跳过重复档位: target=${target}, stride=${predictedStride}（与上一档一致）`);
+                appendRunRecord({
+                    timestamp: new Date().toISOString(),
+                    record_kind: "skip",
+                    run_id: runId,
+                    step_index: loopIndex,
+                    mode,
+                    project_id: projectId,
+                    start_count: startCount,
+                    step_count: stepCount,
+                    max_count: maxCount,
+                    fps_threshold: fpsThreshold,
+                    target_count: target,
+                    predicted_stride: predictedStride,
+                    skip_reason: `重复 stride=${predictedStride}`,
+                });
                 continue;
             }
 
@@ -498,15 +694,45 @@
 
             const tooSlow = fpsNow < fpsThreshold;
             const tooHeavy = state.currentParseMs > 3500 || state.currentBuildMs > 3500 || stepCostMs > 12000;
+            const thresholdReasonParts = [];
+            if (tooSlow) {
+                thresholdReasonParts.push(`fps ${fpsNow.toFixed(1)} < ${fpsThreshold}`);
+            }
+            if (tooHeavy) {
+                thresholdReasonParts.push("解析/建模/总耗时过高");
+            }
+            const thresholdReason = thresholdReasonParts.join(" + ");
+
+            appendRunRecord({
+                timestamp: new Date().toISOString(),
+                record_kind: "step",
+                run_id: runId,
+                step_index: loopIndex,
+                mode,
+                project_id: projectId,
+                start_count: startCount,
+                step_count: stepCount,
+                max_count: maxCount,
+                fps_threshold: fpsThreshold,
+                target_count: target,
+                actual_count: Number(rendered.pointCount) || 0,
+                json_bytes: Number(rendered.jsonBytes) || 0,
+                predicted_stride: predictedStride,
+                stride: Number(rendered.stride) || 0,
+                fps: safeNumber(fpsNow),
+                parse_ms: safeNumber(state.currentParseMs),
+                build_ms: safeNumber(state.currentBuildMs),
+                total_ms: safeNumber(stepCostMs),
+                threshold_hit: tooSlow || tooHeavy ? "1" : "0",
+                threshold_reason: thresholdReason,
+            });
+
             if (tooSlow || tooHeavy) {
-                const reason = [];
-                if (tooSlow) {
-                    reason.push(`fps ${fpsNow.toFixed(1)} < ${fpsThreshold}`);
-                }
-                if (tooHeavy) {
-                    reason.push("解析/建模/总耗时过高");
-                }
-                stopReason = `达到阈值: ${reason.join(" + ")}`;
+                stopReason = `达到阈值: ${thresholdReason}`;
+                stopFps = fpsNow;
+                stopParseMs = state.currentParseMs;
+                stopBuildMs = state.currentBuildMs;
+                stopTotalMs = stepCostMs;
                 break;
             }
 
@@ -525,6 +751,28 @@
             ? `${state.lastStableCount} / ${formatBytes(state.lastStableBytes)}`
             : "--";
         logLine(`压测结束: ${stopReason}; source=${mode}; 有效渲染步数=${testedSteps}, 跳过重复步数=${skippedSteps}, 稳定上限=${stableText}`);
+
+        appendRunRecord({
+            timestamp: runTimestamp,
+            record_kind: "summary",
+            run_id: runId,
+            mode,
+            project_id: projectId,
+            start_count: startCount,
+            step_count: stepCount,
+            max_count: maxCount,
+            fps_threshold: fpsThreshold,
+            stable_count: Number(state.lastStableCount) || 0,
+            stable_json_bytes: Number(state.lastStableBytes) || 0,
+            stop_fps: safeNumber(stopFps),
+            stop_parse_ms: safeNumber(stopParseMs),
+            stop_build_ms: safeNumber(stopBuildMs),
+            stop_total_ms: safeNumber(stopTotalMs),
+            stop_reason: stopReason,
+            tested_steps: testedSteps,
+            skipped_steps: skippedSteps,
+            run_duration_ms: performance.now() - runStartedAt,
+        });
     }
 
     function stopRun() {
@@ -612,6 +860,9 @@
     }
 
     async function bootstrap() {
+        state.runRecords = loadRunRecords();
+        updateRecordCountUi();
+
         initScene();
         await initProjects();
         applyModeUi();
@@ -651,6 +902,18 @@
             stopRun();
             logLine("已停止自动压测");
         });
+
+        if (dom.exportCsvBtn) {
+            dom.exportCsvBtn.addEventListener("click", () => {
+                downloadCsv();
+            });
+        }
+
+        if (dom.clearRecordsBtn) {
+            dom.clearRecordsBtn.addEventListener("click", () => {
+                clearRunRecords();
+            });
+        }
 
         animate();
         logLine("压测页已就绪：按你的原始方案测试单包 JSON（色带+折线）的卡顿阈值。");
