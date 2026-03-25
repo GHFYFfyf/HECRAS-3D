@@ -9,6 +9,9 @@
         stepCountInput: document.getElementById("stepCountInput"),
         maxCountInput: document.getElementById("maxCountInput"),
         fpsThresholdInput: document.getElementById("fpsThresholdInput"),
+        parseBuildLimitInput: document.getElementById("parseBuildLimitInput"),
+        totalLimitInput: document.getElementById("totalLimitInput"),
+        includeInvalidVerticesInput: document.getElementById("includeInvalidVerticesInput"),
         loadBaseBtn: document.getElementById("loadBaseBtn"),
         runAutoBtn: document.getElementById("runAutoBtn"),
         renderOnceBtn: document.getElementById("renderOnceBtn"),
@@ -28,6 +31,8 @@
     };
 
     const RUN_RECORDS_STORAGE_KEY = "baselineStressRunRecords.v2";
+    const DEFAULT_PARSE_BUILD_LIMIT_MS = 5000;
+    const DEFAULT_TOTAL_LIMIT_MS = 12000;
 
     const state = {
         scene: null,
@@ -111,6 +116,9 @@
             "step_count",
             "max_count",
             "fps_threshold",
+            "parse_build_limit_ms",
+            "total_limit_ms",
+            "include_invalid_vertices",
             "target_count",
             "actual_count",
             "json_bytes",
@@ -133,6 +141,8 @@
             "tested_steps",
             "skipped_steps",
             "run_duration_ms",
+            "run_started_at",
+            "run_finished_at",
         ];
         const lines = [headers.join(",")];
         for (let i = 0; i < records.length; i += 1) {
@@ -149,6 +159,9 @@
                 r.step_count,
                 r.max_count,
                 r.fps_threshold,
+                r.parse_build_limit_ms,
+                r.total_limit_ms,
+                r.include_invalid_vertices,
                 r.target_count,
                 r.actual_count,
                 r.json_bytes,
@@ -171,6 +184,8 @@
                 r.tested_steps,
                 r.skipped_steps,
                 Number.isFinite(Number(r.run_duration_ms)) ? Number(r.run_duration_ms).toFixed(2) : "",
+                r.run_started_at,
+                r.run_finished_at,
             ].map(csvEscape);
             lines.push(row.join(","));
         }
@@ -256,6 +271,20 @@
         } catch (_ignored) {
             return String(error || "unknown error");
         }
+    }
+
+    function getIncludeInvalidVertices() {
+        if (!dom.includeInvalidVerticesInput) {
+            return true;
+        }
+        return Boolean(dom.includeInvalidVerticesInput.checked);
+    }
+
+    function getRunThresholdConfig() {
+        return {
+            parseBuildLimitMs: clampInt(dom.parseBuildLimitInput?.value, DEFAULT_PARSE_BUILD_LIMIT_MS, 100, 60000),
+            totalLimitMs: clampInt(dom.totalLimitInput?.value, DEFAULT_TOTAL_LIMIT_MS, 500, 120000),
+        };
     }
 
     function getDataMode() {
@@ -536,11 +565,12 @@
         };
     }
 
-    async function fetchStressPayload(projectId, targetPoints) {
+    async function fetchStressPayload(projectId, targetPoints, includeInvalidVertices) {
         const mode = getDataMode();
+        const includeFlag = includeInvalidVertices ? "true" : "false";
         const url = mode === "tif"
-            ? `/api/projects/${encodeURIComponent(projectId)}/tif-stress-json?target_points=${encodeURIComponent(targetPoints)}&include_invalid_vertices=true`
-            : `/api/stress/synthetic-grid-json?target_points=${encodeURIComponent(targetPoints)}&include_invalid_vertices=true`;
+            ? `/api/projects/${encodeURIComponent(projectId)}/tif-stress-json?target_points=${encodeURIComponent(targetPoints)}&include_invalid_vertices=${includeFlag}`
+            : `/api/stress/synthetic-grid-json?target_points=${encodeURIComponent(targetPoints)}&include_invalid_vertices=${includeFlag}`;
         const fetchStart = performance.now();
         const response = await fetch(url, { headers: { Accept: "application/json" } });
         const fetchEnd = performance.now();
@@ -563,14 +593,14 @@
         };
     }
 
-    async function loadAndRender(targetPoints) {
+    async function loadAndRender(targetPoints, includeInvalidVertices = true) {
         const mode = getDataMode();
         const projectId = String(dom.projectSelect.value || "").trim();
         if (mode === "tif" && !projectId) {
             throw new Error("没有可用项目");
         }
 
-        const request = await fetchStressPayload(projectId, targetPoints);
+        const request = await fetchStressPayload(projectId, targetPoints, includeInvalidVertices);
         const buildStart = performance.now();
         const renderData = buildSurfaceAndWire(request.payload);
         const buildEnd = performance.now();
@@ -623,10 +653,12 @@
         const stepCount = clampInt(dom.stepCountInput.value, 1000000, 5000, 5000000);
         const maxCount = clampInt(dom.maxCountInput.value, 10000000, 10000, 10000000);
         const fpsThreshold = clampInt(dom.fpsThresholdInput.value, 20, 1, 240);
+        const includeInvalidVertices = getIncludeInvalidVertices();
+        const thresholdConfig = getRunThresholdConfig();
         const mode = getDataMode();
         const projectId = mode === "tif" ? String(dom.projectSelect.value || "") : "synthetic";
         const runStartedAt = performance.now();
-        const runTimestamp = new Date().toISOString();
+        const runStartedIso = new Date().toISOString();
         const runId = buildRunId(mode, projectId);
 
         state.running = true;
@@ -646,7 +678,7 @@
         let stopTotalMs = 0;
         let loopIndex = 0;
 
-        logLine(`开始自动压测: start=${startCount}, step=${stepCount}, max=${maxCount}, fpsFloor=${fpsThreshold}`);
+        logLine(`开始自动压测: start=${startCount}, step=${stepCount}, max=${maxCount}, fpsFloor=${fpsThreshold}, parse/build阈值=${thresholdConfig.parseBuildLimitMs}ms, total阈值=${thresholdConfig.totalLimitMs}ms, includeInvalid=${includeInvalidVertices ? "1" : "0"}`);
 
         for (let target = startCount; target <= maxCount; target += stepCount) {
             loopIndex += 1;
@@ -675,15 +707,19 @@
                     step_count: stepCount,
                     max_count: maxCount,
                     fps_threshold: fpsThreshold,
+                    parse_build_limit_ms: thresholdConfig.parseBuildLimitMs,
+                    total_limit_ms: thresholdConfig.totalLimitMs,
+                    include_invalid_vertices: includeInvalidVertices ? "1" : "0",
                     target_count: target,
                     predicted_stride: predictedStride,
                     skip_reason: `重复 stride=${predictedStride}`,
+                    run_started_at: runStartedIso,
                 });
                 continue;
             }
 
             const stepStart = performance.now();
-            const rendered = await loadAndRender(target);
+            const rendered = await loadAndRender(target, includeInvalidVertices);
             testedSteps += 1;
             prevPredictedStride = rendered.stride || predictedStride || prevPredictedStride;
             await new Promise((resolve) => window.setTimeout(resolve, 1200));
@@ -693,7 +729,9 @@
             logLine(`判定: target=${target}, fps=${fpsNow.toFixed(1)}, total=${stepCostMs.toFixed(1)}ms`);
 
             const tooSlow = fpsNow < fpsThreshold;
-            const tooHeavy = state.currentParseMs > 3500 || state.currentBuildMs > 3500 || stepCostMs > 12000;
+            const tooHeavy = state.currentParseMs > thresholdConfig.parseBuildLimitMs
+                || state.currentBuildMs > thresholdConfig.parseBuildLimitMs
+                || stepCostMs > thresholdConfig.totalLimitMs;
             const thresholdReasonParts = [];
             if (tooSlow) {
                 thresholdReasonParts.push(`fps ${fpsNow.toFixed(1)} < ${fpsThreshold}`);
@@ -714,6 +752,9 @@
                 step_count: stepCount,
                 max_count: maxCount,
                 fps_threshold: fpsThreshold,
+                parse_build_limit_ms: thresholdConfig.parseBuildLimitMs,
+                total_limit_ms: thresholdConfig.totalLimitMs,
+                include_invalid_vertices: includeInvalidVertices ? "1" : "0",
                 target_count: target,
                 actual_count: Number(rendered.pointCount) || 0,
                 json_bytes: Number(rendered.jsonBytes) || 0,
@@ -725,6 +766,7 @@
                 total_ms: safeNumber(stepCostMs),
                 threshold_hit: tooSlow || tooHeavy ? "1" : "0",
                 threshold_reason: thresholdReason,
+                run_started_at: runStartedIso,
             });
 
             if (tooSlow || tooHeavy) {
@@ -751,9 +793,10 @@
             ? `${state.lastStableCount} / ${formatBytes(state.lastStableBytes)}`
             : "--";
         logLine(`压测结束: ${stopReason}; source=${mode}; 有效渲染步数=${testedSteps}, 跳过重复步数=${skippedSteps}, 稳定上限=${stableText}`);
+        const runFinishedIso = new Date().toISOString();
 
         appendRunRecord({
-            timestamp: runTimestamp,
+            timestamp: runFinishedIso,
             record_kind: "summary",
             run_id: runId,
             mode,
@@ -762,6 +805,9 @@
             step_count: stepCount,
             max_count: maxCount,
             fps_threshold: fpsThreshold,
+            parse_build_limit_ms: thresholdConfig.parseBuildLimitMs,
+            total_limit_ms: thresholdConfig.totalLimitMs,
+            include_invalid_vertices: includeInvalidVertices ? "1" : "0",
             stable_count: Number(state.lastStableCount) || 0,
             stable_json_bytes: Number(state.lastStableBytes) || 0,
             stop_fps: safeNumber(stopFps),
@@ -772,6 +818,8 @@
             tested_steps: testedSteps,
             skipped_steps: skippedSteps,
             run_duration_ms: performance.now() - runStartedAt,
+            run_started_at: runStartedIso,
+            run_finished_at: runFinishedIso,
         });
     }
 
@@ -876,14 +924,14 @@
 
         dom.loadBaseBtn.addEventListener("click", () => {
             const target = clampInt(dom.startCountInput.value, 2000000, 10000, 10000000);
-            loadAndRender(target).catch((error) => {
+            loadAndRender(target, getIncludeInvalidVertices()).catch((error) => {
                 logLine(`错误: ${toErrorText(error)}`);
             });
         });
 
         dom.renderOnceBtn.addEventListener("click", () => {
             const target = clampInt(dom.startCountInput.value, 2000000, 10000, 10000000);
-            loadAndRender(target).catch((error) => {
+            loadAndRender(target, getIncludeInvalidVertices()).catch((error) => {
                 logLine(`错误: ${toErrorText(error)}`);
             });
         });

@@ -243,7 +243,21 @@
                     <span>Project Viewport</span>
                 </div>
             </div>
-            <div class="project-chip" id="projectChip">项目 ID: --</div>
+            <div style="display: flex; gap: 8px;">
+                <div class="project-chip" id="projectChip">项目 ID: --</div>
+                <div class="project-chip" style="pointer-events: auto; padding: 4px; display: flex; gap: 4px;">
+                    <span style="padding: 0 8px; color: var(--ui-muted); align-self: center;">传输模式:</span>
+                    <button class="mode-btn" data-mode="single-json" style="background: transparent; border: 1px solid var(--ui-border); color: var(--ui-muted); padding: 4px 8px; border-radius: 999px; cursor: pointer;">单包 JSON</button>
+                    <button class="mode-btn" data-mode="tile-json" style="background: transparent; border: 1px solid var(--ui-border); color: var(--ui-muted); padding: 4px 8px; border-radius: 999px; cursor: pointer;">分块 JSON</button>
+                    <button class="mode-btn" data-mode="tile-binary" style="background: transparent; border: 1px solid var(--ui-border); color: var(--ui-muted); padding: 4px 8px; border-radius: 999px; cursor: pointer;">分块 Binary</button>
+                </div>
+                <div class="project-chip" style="pointer-events: auto; padding: 4px; display: flex; gap: 4px;">
+                    <span style="padding: 0 8px; color: var(--ui-muted); align-self: center;">Stride:</span>
+                    <button class="stride-btn" data-stride="auto" style="background: transparent; border: 1px solid var(--ui-border); color: var(--ui-muted); padding: 4px 8px; border-radius: 999px; cursor: pointer;">Auto</button>
+                    <button class="stride-btn" data-stride="1" style="background: transparent; border: 1px solid var(--ui-border); color: var(--ui-muted); padding: 4px 8px; border-radius: 999px; cursor: pointer;">1</button>
+                    <button class="stride-btn" data-stride="4" style="background: transparent; border: 1px solid var(--ui-border); color: var(--ui-muted); padding: 4px 8px; border-radius: 999px; cursor: pointer;">4</button>
+                </div>
+            </div>
         </div>
 
         <aside class="scene-side" aria-label="性能拆解">
@@ -279,17 +293,52 @@
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-    <script src="/assets/js/three-empty.js?v=20260323-stable-rebuild-v1"></script>
+    <script src="/assets/js/three-empty.js?v=20260324-transport-mode-v2"></script>
     <script src="/assets/js/three-hdf-overlay.js?v=20260323-near-expand-v1"></script>
     <script>
         (function () {
             const params = new URLSearchParams(window.location.search);
             const chip = document.getElementById("projectChip");
-            if (!chip) {
-                return;
+            if (chip) {
+                const projectId = params.get("project_id") || "--";
+                chip.textContent = `项目 ID: ${projectId}`;
             }
-            const projectId = params.get("project_id") || "--";
-            chip.textContent = `项目 ID: ${projectId}`;
+            
+            // Handle transport mode selector
+            const currentMode = (params.get("tile_transport") || "tile-binary").toLowerCase();
+            const modeBtns = document.querySelectorAll(".mode-btn");
+            modeBtns.forEach(btn => {
+                if (btn.dataset.mode === currentMode) {
+                    btn.style.background = "var(--ui-accent-soft)";
+                    btn.style.color = "var(--ui-accent)";
+                    btn.style.borderColor = "var(--ui-accent)";
+                }
+                btn.addEventListener("click", () => {
+                    const newParams = new URLSearchParams(window.location.search);
+                    newParams.set("tile_transport", btn.dataset.mode);
+                    window.location.search = newParams.toString();
+                });
+            });
+
+            // Handle stride selector
+            const currentStride = (params.get("fixed_stride") || "auto").toLowerCase();
+            const strideBtns = document.querySelectorAll(".stride-btn");
+            strideBtns.forEach(btn => {
+                if (btn.dataset.stride === currentStride) {
+                    btn.style.background = "var(--ui-accent-soft)";
+                    btn.style.color = "var(--ui-accent)";
+                    btn.style.borderColor = "var(--ui-accent)";
+                }
+                btn.addEventListener("click", () => {
+                    const newParams = new URLSearchParams(window.location.search);
+                    if (btn.dataset.stride === "auto") {
+                        newParams.delete("fixed_stride");
+                    } else {
+                        newParams.set("fixed_stride", btn.dataset.stride);
+                    }
+                    window.location.search = newParams.toString();
+                });
+            });
         })();
     </script>
 </body>

@@ -287,6 +287,21 @@
                     </label>
                 </div>
 
+                <div class="grid2">
+                    <label>解析/建模阈值（ms）
+                        <input id="parseBuildLimitInput" type="number" min="100" step="100" value="5000">
+                    </label>
+                    <label>单步总耗时阈值（ms）
+                        <input id="totalLimitInput" type="number" min="500" step="500" value="12000">
+                    </label>
+                </div>
+
+                <div class="grid2">
+                    <label>包含无效顶点
+                        <input id="includeInvalidVerticesInput" type="checkbox" checked>
+                    </label>
+                </div>
+
                 <div class="actions">
                     <button id="loadBaseBtn">加载基准包（起始点数）</button>
                     <button class="accent" id="runAutoBtn">自动阶梯压测</button>
@@ -321,6 +336,6 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-<script src="/assets/js/stress-points.js?v=20260323-3"></script>
+<script src="/assets/js/stress-points.js?v=20260324-2"></script>
 </body>
 </html>

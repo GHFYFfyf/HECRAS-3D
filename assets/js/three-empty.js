@@ -217,6 +217,13 @@
     const DEBUG_FETCH_LOG = params.get("debug_fetch") === "1";
     const SHOW_TILE_MARKERS = params.get("show_tile_markers") === "1";
     const SHOW_BASE_POINT_CLOUD = params.get("show_base_points") === "1";
+    const TILE_TRANSPORT_MODE = (() => {
+        const raw = String(params.get("tile_transport") || "tile-binary").trim().toLowerCase();
+        if (raw === "single-json" || raw === "tile-json" || raw === "tile-binary") {
+            return raw;
+        }
+        return "tile-binary";
+    })();
     const DEBUG_BINARY_PREVIEW_BYTES = 64;
     let hasLoggedBinarySample = false;
     let hasLoggedJsonFallback = false;
@@ -285,6 +292,28 @@
                 parseMs: parseDone - parseStart,
                 totalMs: parseDone - requestStart,
             };
+
+            // IF single-json mode, we fake the tile grid to be one single giant tile
+            // so the chunking engine just loads the whole thing at once.
+            if (TILE_TRANSPORT_MODE === "single-json") {
+                const width = Number(payload.metadata?.width) || 1000;
+                const height = Number(payload.metadata?.height) || 1000;
+                const totalPoints = Number(payload.metadata?.valid_point_count) || 2000000;
+                payload.tile_grid = { rows: 1, cols: 1 };
+                payload.tiles = [{
+                    tile_id: 0,
+                    tile_row: 0,
+                    tile_col: 0,
+                    row_start: 0,
+                    row_end: height,
+                    col_start: 0,
+                    col_end: width,
+                    center_x: (Number(payload.metadata?.bbox_minx) + Number(payload.metadata?.bbox_maxx)) / 2,
+                    center_y: (Number(payload.metadata?.bbox_miny) + Number(payload.metadata?.bbox_maxy)) / 2,
+                    point_count: totalPoints
+                }];
+            }
+
             return payload;
         },
 
@@ -296,6 +325,31 @@
          */
         async fetchTifTilePayload(resolvedProjectId, tile, stride = 1) {
             const requestStart = performance.now();
+            
+            if (TILE_TRANSPORT_MODE === "single-json") {
+                const singleUrl = `/api/projects/${encodeURIComponent(resolvedProjectId)}/tif-stress-json?target_points=2000000&include_invalid_vertices=true`;
+                const singleResponse = await fetch(singleUrl, { headers: { Accept: "application/json" } });
+                if (!singleResponse.ok) {
+                    throw new Error(`Failed to load single json: HTTP ${singleResponse.status}`);
+                }
+                const parseStart = performance.now();
+                const payload = await singleResponse.json();
+                const parseDone = performance.now();
+                const serverTiming = parseServerTiming(singleResponse.headers.get("server-timing"));
+                payload._transport = "single-json";
+                payload._transport_content_type = "application/json";
+                updatePerfFromFetch(
+                    {
+                        serverGenMs: serverTiming.gen,
+                        serverTotalMs: serverTiming.total,
+                        fetchMs: parseStart - requestStart,
+                        parseMs: parseDone - parseStart,
+                    },
+                    "Terrain single(json)",
+                );
+                return payload;
+            }
+
             const query = new URLSearchParams({
                 row_start: String(tile.row_start),
                 row_end: String(tile.row_end),
@@ -305,6 +359,29 @@
             });
             const binaryUrl = `/api/projects/${encodeURIComponent(resolvedProjectId)}/tif-tile-points-binary?${query.toString()}`;
             const legacyUrl = `/api/projects/${encodeURIComponent(resolvedProjectId)}/tif-tile-points?${query.toString()}`;
+
+            if (TILE_TRANSPORT_MODE === "tile-json") {
+                const legacyResponse = await fetch(legacyUrl, { headers: { Accept: "application/json" } });
+                if (!legacyResponse.ok) {
+                    throw new Error(`Failed to load tif tile points (forced json): HTTP ${legacyResponse.status}`);
+                }
+                const parseStart = performance.now();
+                const payload = await legacyResponse.json();
+                const parseDone = performance.now();
+                const serverTiming = parseServerTiming(legacyResponse.headers.get("server-timing"));
+                payload._transport = "json-forced";
+                payload._transport_content_type = "application/json";
+                updatePerfFromFetch(
+                    {
+                        serverGenMs: serverTiming.gen,
+                        serverTotalMs: serverTiming.total,
+                        fetchMs: parseStart - requestStart,
+                        parseMs: parseDone - parseStart,
+                    },
+                    "Terrain tile(json-forced)",
+                );
+                return payload;
+            }
 
             const binaryResponse = await fetch(binaryUrl, {
                 headers: { Accept: "application/octet-stream, application/json" },
@@ -348,6 +425,10 @@
                     "Terrain tile(json)",
                 );
                 return payload;
+            }
+
+            if (TILE_TRANSPORT_MODE === "tile-binary") {
+                throw new Error(`Failed to load tif tile points (forced binary): HTTP ${binaryResponse.status}`);
             }
 
             // Compatibility fallback for older backend without binary endpoint.
@@ -1221,7 +1302,7 @@
                 hudThinPoints.textContent = String(renderedPointCount);
             }
             if (hudFetchMode) {
-                hudFetchMode.textContent = `bin ${binaryCount} / json ${jsonFallbackCount} / other ${otherCount}`;
+                hudFetchMode.textContent = `${TILE_TRANSPORT_MODE} | bin ${binaryCount} / json ${jsonFallbackCount} / other ${otherCount}`;
             }
             if (hudFetchBytes) {
                 hudFetchBytes.textContent = totalTransportBytes > 0 ? `${(totalTransportBytes / 1024).toFixed(1)} KB` : "--";
@@ -1531,12 +1612,19 @@
             const visibleTiles = renderTiles;
             const visiblePointEstimate = seedTiles.reduce((acc, tile) => acc + (Number(tile.point_count) || 0), 0);
             const forceStrideOne = seedTiles.length === 1;
-            const dynamicStride = forceStrideOne
-                ? 1
-                : Math.max(
-                    1,
-                    Math.min(MAX_DYNAMIC_STRIDE, Math.floor(Math.max(visiblePointEstimate, 1) / TARGET_VIEW_POINTS)),
-                );
+            
+            const urlFixedStride = parseInt(params.get("fixed_stride"), 10);
+            let dynamicStride;
+            if (!isNaN(urlFixedStride) && urlFixedStride > 0) {
+                dynamicStride = urlFixedStride;
+            } else {
+                dynamicStride = forceStrideOne
+                    ? 1
+                    : Math.max(
+                        1,
+                        Math.min(MAX_DYNAMIC_STRIDE, Math.floor(Math.max(visiblePointEstimate, 1) / TARGET_VIEW_POINTS)),
+                    );
+            }
             const taskFactories = [];
             for (let i = 0; i < visibleTiles.length; i += 1) {
                 const tile = visibleTiles[i];
