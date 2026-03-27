@@ -224,6 +224,10 @@
         }
         return "tile-binary";
     })();
+    const INCLUDE_INVALID_VERTICES = (() => {
+        const raw = String(params.get("include_invalid_vertices") || "1").trim().toLowerCase();
+        return !(raw === "0" || raw === "false");
+    })();
     const DEBUG_BINARY_PREVIEW_BYTES = 64;
     let hasLoggedBinarySample = false;
     let hasLoggedJsonFallback = false;
@@ -327,7 +331,7 @@
             const requestStart = performance.now();
             
             if (TILE_TRANSPORT_MODE === "single-json") {
-                const singleUrl = `/api/projects/${encodeURIComponent(resolvedProjectId)}/tif-stress-json?target_points=2000000&include_invalid_vertices=true`;
+                const singleUrl = `/api/projects/${encodeURIComponent(resolvedProjectId)}/tif-stress-json?target_points=2000000&include_invalid_vertices=${INCLUDE_INVALID_VERTICES ? "true" : "false"}`;
                 const singleResponse = await fetch(singleUrl, { headers: { Accept: "application/json" } });
                 if (!singleResponse.ok) {
                     throw new Error(`Failed to load single json: HTTP ${singleResponse.status}`);
@@ -356,6 +360,7 @@
                 col_start: String(tile.col_start),
                 col_end: String(tile.col_end),
                 stride: String(Math.max(1, Math.min(MAX_DYNAMIC_STRIDE, Math.trunc(stride) || 1))),
+                include_invalid_vertices: INCLUDE_INVALID_VERTICES ? "true" : "false",
             });
             const binaryUrl = `/api/projects/${encodeURIComponent(resolvedProjectId)}/tif-tile-points-binary?${query.toString()}`;
             const legacyUrl = `/api/projects/${encodeURIComponent(resolvedProjectId)}/tif-tile-points?${query.toString()}`;
@@ -1302,7 +1307,7 @@
                 hudThinPoints.textContent = String(renderedPointCount);
             }
             if (hudFetchMode) {
-                hudFetchMode.textContent = `${TILE_TRANSPORT_MODE} | bin ${binaryCount} / json ${jsonFallbackCount} / other ${otherCount}`;
+                hudFetchMode.textContent = `${TILE_TRANSPORT_MODE} inv=${INCLUDE_INVALID_VERTICES ? "1" : "0"} | bin ${binaryCount} / json ${jsonFallbackCount} / other ${otherCount}`;
             }
             if (hudFetchBytes) {
                 hudFetchBytes.textContent = totalTransportBytes > 0 ? `${(totalTransportBytes / 1024).toFixed(1)} KB` : "--";

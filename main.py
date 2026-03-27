@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 from threading import Lock
 from time import perf_counter
@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from database import Base, engine, get_db
 from models import Project
+from schemas import ProjectCreate, ProjectCheckRequest
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -27,27 +28,114 @@ BASE_DIR = Path(__file__).resolve().parent
 _HDF_STATIC_CACHE_LOCK = Lock()
 _HDF_STATIC_CACHE: dict[tuple[str, int, str, str, str], dict[str, Any]] = {}
 
+CELL_CENTER_REF = "Geometry/2D Flow Areas/Perimeter 1/Cells Center Coordinate"
+BED_ELEVATION_REF = "Geometry/2D Flow Areas/Perimeter 1/Cells Minimum Elevation"
+WATER_SURFACE_REF = (
+	"Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/"
+	"2D Flow Areas/Perimeter 1/Water Surface"
+)
+FACE_POINT_COORDINATE_REF = "Geometry/2D Flow Areas/Perimeter 1/FacePoints Coordinate"
+FACE_POINT_INDEXES_REF = "Geometry/2D Flow Areas/Perimeter 1/Faces FacePoint Indexes"
+FACE_VELOCITY_REF = (
+	"Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/"
+	"2D Flow Areas/Perimeter 1/Face Velocity"
+)
+TIME_AXIS_REF = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Time"
+TIME_LABEL_REF = (
+	"Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/"
+	"Time Date Stamp"
+)
+
+
+def _compute_bbox_cover_ratio(
+	*,
+	outer_minx: float,
+	outer_miny: float,
+	outer_maxx: float,
+	outer_maxy: float,
+	inner_minx: float,
+	inner_miny: float,
+	inner_maxx: float,
+	inner_maxy: float,
+) -> float:
+	inner_area = max(0.0, inner_maxx - inner_minx) * max(0.0, inner_maxy - inner_miny)
+	if inner_area <= 0:
+		return 0.0
+	overlap_minx = max(outer_minx, inner_minx)
+	overlap_miny = max(outer_miny, inner_miny)
+	overlap_maxx = min(outer_maxx, inner_maxx)
+	overlap_maxy = min(outer_maxy, inner_maxy)
+	overlap_area = max(0.0, overlap_maxx - overlap_minx) * max(0.0, overlap_maxy - overlap_miny)
+	return overlap_area / inner_area
+
+
+def _load_hdf_cell_bbox(
+	hdf_file: Path,
+	cell_center_ref: str,
+) -> tuple[float, float, float, float]:
+	with h5py.File(hdf_file, "r") as hdf:
+		if cell_center_ref not in hdf:
+			raise HTTPException(status_code=400, detail=f"HDF中缺少路径: {cell_center_ref}")
+		coords = np.asarray(hdf[cell_center_ref][:], dtype=np.float64)
+	if coords.ndim != 2 or coords.shape[1] < 2:
+		raise HTTPException(status_code=400, detail="HDF网格中心坐标维度不正确")
+	minx = float(np.nanmin(coords[:, 0]))
+	miny = float(np.nanmin(coords[:, 1]))
+	maxx = float(np.nanmax(coords[:, 0]))
+	maxy = float(np.nanmax(coords[:, 1]))
+	return minx, miny, maxx, maxy
+
+
+def _validate_tif_hdf_alignment(
+	*,
+	tif_bounds: Any,
+	hdf_bbox: tuple[float, float, float, float],
+	min_cover_ratio: float = 0.95,
+) -> float:
+	cover_ratio = _compute_bbox_cover_ratio(
+		outer_minx=float(tif_bounds.left),
+		outer_miny=float(tif_bounds.bottom),
+		outer_maxx=float(tif_bounds.right),
+		outer_maxy=float(tif_bounds.top),
+		inner_minx=hdf_bbox[0],
+		inner_miny=hdf_bbox[1],
+		inner_maxx=hdf_bbox[2],
+		inner_maxy=hdf_bbox[3],
+	)
+	if cover_ratio < min_cover_ratio:
+		raise HTTPException(
+			status_code=400,
+			detail=(
+				f"TIF与HDF空间范围不匹配，HDF网格仅有{cover_ratio * 100:.2f}%落在TIF范围内；"
+				f"TIF bbox=({float(tif_bounds.left):.3f}, {float(tif_bounds.bottom):.3f}, "
+				f"{float(tif_bounds.right):.3f}, {float(tif_bounds.top):.3f})，"
+				f"HDF bbox=({hdf_bbox[0]:.3f}, {hdf_bbox[1]:.3f}, {hdf_bbox[2]:.3f}, {hdf_bbox[3]:.3f})"
+			),
+		)
+	return cover_ratio
+
 
 def _get_hdf_static_data(
 	hdf_path: Path,
 	cell_center_ref: str,
 	bed_elevation_ref: str,
 	water_surface_ref: str,
+	use_cache: bool = True,
 ) -> dict[str, Any]:
-	"""Load and cache HDF datasets that do not change per time index."""
-	hdf_stat = hdf_path.stat()
-	cache_key = (
-		str(hdf_path),
-		int(hdf_stat.st_mtime_ns),
-		cell_center_ref,
-		bed_elevation_ref,
-		water_surface_ref,
-	)
-
-	with _HDF_STATIC_CACHE_LOCK:
-		cached = _HDF_STATIC_CACHE.get(cache_key)
-	if cached is not None:
-		return cached
+	cache_key = None
+	if use_cache:
+		hdf_stat = hdf_path.stat()
+		cache_key = (
+			str(hdf_path),
+			int(hdf_stat.st_mtime_ns),
+			cell_center_ref,
+			bed_elevation_ref,
+			water_surface_ref,
+		)
+		with _HDF_STATIC_CACHE_LOCK:
+			cached = _HDF_STATIC_CACHE.get(cache_key)
+		if cached is not None:
+			return cached
 
 	with h5py.File(hdf_path, "r") as hdf:
 		if cell_center_ref not in hdf:
@@ -73,20 +161,23 @@ def _get_hdf_static_data(
 		if bed.shape[0] != cell_count or int(water_surface_ds.shape[1]) != cell_count:
 			raise HTTPException(status_code=400, detail="Inconsistent HDF dataset sizes")
 
-	static_data = {
-		"coords": coords,
-		"bed": bed,
-		"cell_count": cell_count,
-		"time_step_count": time_step_count,
-	}
+		static_data = {
+			"coords": coords,
+			"bed": bed,
+			"cell_count": cell_count,
+			"time_step_count": time_step_count,
+		}
+	if not use_cache:
+		return static_data
 
-	# Drop stale entries for the same file to keep cache bounded when HDF is updated.
 	with _HDF_STATIC_CACHE_LOCK:
+		cached = _HDF_STATIC_CACHE.get(cache_key)
+		if cached is not None:
+			return cached
 		stale_keys = [key for key in _HDF_STATIC_CACHE if key[0] == str(hdf_path) and key != cache_key]
 		for stale_key in stale_keys:
 			_HDF_STATIC_CACHE.pop(stale_key, None)
 		_HDF_STATIC_CACHE[cache_key] = static_data
-
 	return static_data
 
 
@@ -176,6 +267,25 @@ def _sample_tif_tile_window(
 		"valid_flat": valid_flat,
 		"grid_rows": int(sampled_rows.size),
 		"grid_cols": int(sampled_cols.size),
+	}
+
+
+def _apply_include_invalid_vertices(sample: dict[str, Any], include_invalid_vertices: bool) -> dict[str, Any]:
+	if include_invalid_vertices:
+		return sample
+	valid_flat = np.asarray(sample["valid_flat"], dtype=np.uint8)
+	if valid_flat.size == 0:
+		return sample
+	keep_mask = valid_flat.astype(bool)
+	return {
+		"rows": np.asarray(sample["rows"], dtype=np.int32)[keep_mask],
+		"cols": np.asarray(sample["cols"], dtype=np.int32)[keep_mask],
+		"x_vals": np.asarray(sample["x_vals"], dtype=np.float32)[keep_mask],
+		"y_vals": np.asarray(sample["y_vals"], dtype=np.float32)[keep_mask],
+		"z_vals": np.asarray(sample["z_vals"], dtype=np.float32)[keep_mask],
+		"valid_flat": np.ones(int(np.count_nonzero(keep_mask)), dtype=np.uint8),
+		"grid_rows": int(sample.get("grid_rows", 0)),
+		"grid_cols": int(sample.get("grid_cols", 0)),
 	}
 
 
@@ -389,6 +499,113 @@ def delete_project(project_id: int, db: Session = Depends(get_db)) -> dict[str, 
 	db.commit()
 	# Send: deletion result flag back to frontend assets/js/project-cards.js (deleteProject).
 	return {"ok": True}
+
+@app.post("/api/projects/check")
+def check_project_files(request: ProjectCheckRequest) -> dict[str, Any]:
+	tif_file = Path(request.tif_path)
+	hdf_file = Path(request.hdf_path)
+
+	if not tif_file.exists():
+		return {"ok": False, "error": f"TIF文件不存在: {request.tif_path}"}
+	if not hdf_file.exists():
+		return {"ok": False, "error": f"HDF文件不存在: {request.hdf_path}"}
+
+	try:
+		with rasterio.open(tif_file) as src:
+			bounds = src.bounds
+	except Exception as e:
+		return {"ok": False, "error": f"TIF文件读取失败: {e}"}
+
+	try:
+		hdf_bbox = _load_hdf_cell_bbox(hdf_file, CELL_CENTER_REF)
+		cover_ratio = _validate_tif_hdf_alignment(tif_bounds=bounds, hdf_bbox=hdf_bbox)
+	except HTTPException as e:
+		return {"ok": False, "error": str(e.detail)}
+	except Exception as e:
+		return {"ok": False, "error": f"HDF文件读取失败: {e}"}
+
+	return {"ok": True, "cover_ratio": cover_ratio}
+
+@app.post("/api/projects")
+def create_project(
+	request: ProjectCreate,
+	db: Session = Depends(get_db),
+) -> dict[str, Any]:
+	tif_file = Path(request.tif_path)
+	hdf_file = Path(request.hdf_path)
+
+	if not tif_file.exists():
+		raise HTTPException(status_code=400, detail=f"TIF文件不存在: {tif_file}")
+	if not hdf_file.exists():
+		raise HTTPException(status_code=400, detail=f"HDF文件不存在: {hdf_file}")
+
+	try:
+		with rasterio.open(tif_file) as src:
+			bounds = src.bounds
+			epsg = src.crs.to_epsg() if src.crs else None
+			crs = f"EPSG:{epsg}" if epsg is not None else "UNKNOWN"
+			terrain_nodata = src.nodata
+	except Exception as e:
+		raise HTTPException(status_code=400, detail=f"TIF文件读取失败: {e}")
+	hdf_bbox = _load_hdf_cell_bbox(hdf_file, CELL_CENTER_REF)
+	_ = _validate_tif_hdf_alignment(tif_bounds=bounds, hdf_bbox=hdf_bbox)
+
+	try:
+		with h5py.File(hdf_file, "r") as hdf:
+			if CELL_CENTER_REF not in hdf:
+				raise HTTPException(status_code=400, detail=f"HDF中缺少路径: {CELL_CENTER_REF}")
+			if WATER_SURFACE_REF not in hdf:
+				raise HTTPException(status_code=400, detail=f"HDF中缺少路径: {WATER_SURFACE_REF}")
+			if FACE_VELOCITY_REF not in hdf:
+				raise HTTPException(status_code=400, detail=f"HDF中缺少路径: {FACE_VELOCITY_REF}")
+
+			cell_count = int(hdf[CELL_CENTER_REF].shape[0])
+			face_count = int(hdf[FACE_VELOCITY_REF].shape[1])
+			time_step_count = int(hdf[WATER_SURFACE_REF].shape[0])
+	except HTTPException:
+		raise
+	except Exception as e:
+		raise HTTPException(status_code=400, detail=f"HDF文件读取错误: {e}")
+
+	now = datetime.now(UTC)
+	hdf_mtime = datetime.fromtimestamp(hdf_file.stat().st_mtime, UTC)
+	tif_mtime = datetime.fromtimestamp(tif_file.stat().st_mtime, UTC)
+
+	project = Project(
+		name=request.name,
+		crs=crs,
+		tif_path=request.tif_path,
+		hdf_path=request.hdf_path,
+		summary=request.summary,
+		cell_center_ref=CELL_CENTER_REF,
+		bed_elevation_ref=BED_ELEVATION_REF,
+		water_surface_ref=WATER_SURFACE_REF,
+		face_point_coordinate_ref=FACE_POINT_COORDINATE_REF,
+		face_point_indexes_ref=FACE_POINT_INDEXES_REF,
+		face_velocity_ref=FACE_VELOCITY_REF,
+		time_axis_ref=TIME_AXIS_REF,
+		time_label_ref=TIME_LABEL_REF,
+		bbox_minx=bounds.left,
+		bbox_miny=bounds.bottom,
+		bbox_maxx=bounds.right,
+		bbox_maxy=bounds.top,
+		terrain_nodata=terrain_nodata,
+		cell_count=cell_count,
+		face_count=face_count,
+		time_step_count=time_step_count,
+		file_mtime_hdf=hdf_mtime,
+		file_mtime_tif=tif_mtime,
+		indexed_at=now,
+	)
+	db.add(project)
+	try:
+		db.commit()
+		db.refresh(project)
+	except Exception as e:
+		db.rollback()
+		raise HTTPException(status_code=400, detail=f"数据库错误: {e}")
+
+	return {"ok": True, "project_id": project.id}
 
 
 @app.get("/api/projects/{project_id}/tif-points")
@@ -914,6 +1131,7 @@ def get_project_tif_tile_points(
 	col_start: int = Query(ge=0),
 	col_end: int = Query(ge=1),
 	stride: int = Query(default=1, ge=1, le=32),
+	include_invalid_vertices: bool = Query(default=True),
 	response: FastAPIResponse = None,
 	db: Session = Depends(get_db),
 ) -> dict[str, object]:
@@ -936,6 +1154,7 @@ def get_project_tif_tile_points(
 			col_end=col_end,
 			stride=stride,
 		)
+		sample = _apply_include_invalid_vertices(sample, include_invalid_vertices)
 
 		result = _build_tif_tile_points_json(
 			project_id=project_id,
@@ -960,6 +1179,7 @@ def get_project_tif_tile_points_binary(
 	col_start: int = Query(ge=0),
 	col_end: int = Query(ge=1),
 	stride: int = Query(default=1, ge=1, le=32),
+	include_invalid_vertices: bool = Query(default=True),
 	db: Session = Depends(get_db),
 ) -> Response:
 	"""Return compact binary tile samples for faster transfer and decode."""
@@ -981,6 +1201,7 @@ def get_project_tif_tile_points_binary(
 			col_end=col_end,
 			stride=stride,
 		)
+		sample = _apply_include_invalid_vertices(sample, include_invalid_vertices)
 	t_sample_ready = perf_counter()
 
 	payload = _encode_tif_tile_points_binary(
@@ -1012,6 +1233,7 @@ def get_project_hdf_water_depth(
 	time_index: int = Query(default=-1, ge=-1),
 	max_points: int = Query(default=80000, ge=1000, le=300000),
 	include_dry: bool = Query(default=False),
+	use_cache: bool = Query(default=True),
 	response: FastAPIResponse = None,
 	db: Session = Depends(get_db),
 ) -> dict[str, object]:
@@ -1038,6 +1260,7 @@ def get_project_hdf_water_depth(
 		cell_center_ref=cell_center_ref,
 		bed_elevation_ref=bed_elevation_ref,
 		water_surface_ref=water_surface_ref,
+		use_cache=use_cache,
 	)
 	t_cache_ready = perf_counter()
 	coords = static_data["coords"]
@@ -1152,6 +1375,7 @@ def get_project_hdf_water_depth(
 	print(
 		"[perf][hdf-water-depth] "
 		f"project_id={project_id} time_index={resolved_time_index} "
+		f"use_cache={int(use_cache)} "
 		f"valid={valid_count} sampled={len(points)} stride={stride} "
 		f"total_ms={total_ms:.2f} cache_ms={cache_ms:.2f} "
 		f"water_read_ms={water_read_ms:.2f} filter_ms={filter_ms:.2f} "

@@ -257,6 +257,16 @@
                     <button class="stride-btn" data-stride="1" style="background: transparent; border: 1px solid var(--ui-border); color: var(--ui-muted); padding: 4px 8px; border-radius: 999px; cursor: pointer;">1</button>
                     <button class="stride-btn" data-stride="4" style="background: transparent; border: 1px solid var(--ui-border); color: var(--ui-muted); padding: 4px 8px; border-radius: 999px; cursor: pointer;">4</button>
                 </div>
+                <div class="project-chip" style="pointer-events: auto; padding: 4px; display: flex; gap: 4px;">
+                    <span style="padding: 0 8px; color: var(--ui-muted); align-self: center;">无效顶点:</span>
+                    <button class="invalid-btn" data-invalid="1" style="background: transparent; border: 1px solid var(--ui-border); color: var(--ui-muted); padding: 4px 8px; border-radius: 999px; cursor: pointer;">开</button>
+                    <button class="invalid-btn" data-invalid="0" style="background: transparent; border: 1px solid var(--ui-border); color: var(--ui-muted); padding: 4px 8px; border-radius: 999px; cursor: pointer;">关</button>
+                </div>
+                <div class="project-chip" style="pointer-events: auto; padding: 4px; display: flex; gap: 4px;">
+                    <span style="padding: 0 8px; color: var(--ui-muted); align-self: center;">HDF缓存:</span>
+                    <button class="cache-btn" data-cache="warm" style="background: transparent; border: 1px solid var(--ui-border); color: var(--ui-muted); padding: 4px 8px; border-radius: 999px; cursor: pointer;">热启动</button>
+                    <button class="cache-btn" data-cache="cold" style="background: transparent; border: 1px solid var(--ui-border); color: var(--ui-muted); padding: 4px 8px; border-radius: 999px; cursor: pointer;">冷启动</button>
+                </div>
             </div>
         </div>
 
@@ -293,8 +303,8 @@
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-    <script src="/assets/js/three-empty.js?v=20260324-transport-mode-v2"></script>
-    <script src="/assets/js/three-hdf-overlay.js?v=20260323-near-expand-v1"></script>
+    <script src="/assets/js/three-empty.js?v=20260324-transport-mode-v3"></script>
+    <script src="/assets/js/three-hdf-overlay.js?v=20260324-hdf-cache-mode-v1"></script>
     <script>
         (function () {
             const params = new URLSearchParams(window.location.search);
@@ -336,6 +346,36 @@
                     } else {
                         newParams.set("fixed_stride", btn.dataset.stride);
                     }
+                    window.location.search = newParams.toString();
+                });
+            });
+
+            const currentInvalid = (params.get("include_invalid_vertices") || "1").toLowerCase();
+            const invalidBtns = document.querySelectorAll(".invalid-btn");
+            invalidBtns.forEach(btn => {
+                if (btn.dataset.invalid === currentInvalid) {
+                    btn.style.background = "var(--ui-accent-soft)";
+                    btn.style.color = "var(--ui-accent)";
+                    btn.style.borderColor = "var(--ui-accent)";
+                }
+                btn.addEventListener("click", () => {
+                    const newParams = new URLSearchParams(window.location.search);
+                    newParams.set("include_invalid_vertices", btn.dataset.invalid);
+                    window.location.search = newParams.toString();
+                });
+            });
+
+            const currentCache = (params.get("hdf_cache_mode") || "warm").toLowerCase();
+            const cacheBtns = document.querySelectorAll(".cache-btn");
+            cacheBtns.forEach(btn => {
+                if (btn.dataset.cache === currentCache) {
+                    btn.style.background = "var(--ui-accent-soft)";
+                    btn.style.color = "var(--ui-accent)";
+                    btn.style.borderColor = "var(--ui-accent)";
+                }
+                btn.addEventListener("click", () => {
+                    const newParams = new URLSearchParams(window.location.search);
+                    newParams.set("hdf_cache_mode", btn.dataset.cache);
                     window.location.search = newParams.toString();
                 });
             });

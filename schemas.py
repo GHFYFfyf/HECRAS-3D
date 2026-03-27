@@ -24,6 +24,11 @@ class ProjectCreate(ProjectBase):
     pass
 
 
+class ProjectCheckRequest(BaseModel):
+    tif_path: str = Field(min_length=1, max_length=500)
+    hdf_path: str = Field(min_length=1, max_length=500)
+
+
 class ProjectListResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

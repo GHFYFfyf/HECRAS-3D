@@ -72,6 +72,7 @@
         overlay: null,
         marker: null,
         renderMode: RENDER_MODE_AUTO,
+        cacheMode: "warm",
         isLoading: false,
         lastRequestId: 0,
     };
@@ -107,6 +108,15 @@
                 return rawMode;
             }
             return RENDER_MODE_AUTO;
+        },
+
+        resolveCacheModeFromUrl() {
+            const params = new URLSearchParams(window.location.search);
+            const rawMode = String(params.get("hdf_cache_mode") || "warm").toLowerCase();
+            if (rawMode === "cold" || rawMode === "warm") {
+                return rawMode;
+            }
+            return "warm";
         },
 
         /**
@@ -184,8 +194,9 @@
             const safeTimeIndex = Number.isInteger(timeIndex) ? timeIndex : -1;
             console.log("[hdf-water-depth] request time_index", safeTimeIndex);
             const fetchStartAt = performance.now();
+            const useCache = RuntimeState.cacheMode !== "cold";
             const response = await fetch(
-                `/api/projects/${encodeURIComponent(projectId)}/hdf-water-depth?time_index=${encodeURIComponent(safeTimeIndex)}&max_points=${MAX_POINTS_QUERY}&include_dry=true`,
+                `/api/projects/${encodeURIComponent(projectId)}/hdf-water-depth?time_index=${encodeURIComponent(safeTimeIndex)}&max_points=${MAX_POINTS_QUERY}&include_dry=true&use_cache=${useCache ? "true" : "false"}`,
                 { headers: { Accept: "application/json" } },
             );
             if (!response.ok) {
@@ -204,7 +215,7 @@
             setPerfText(perfDom.backendTransfer, formatMs(backendTransferMs));
             setPerfText(perfDom.frontendFetch, formatMs(fetchMs));
             setPerfText(perfDom.frontendParse, formatMs(parseMs));
-            setPerfText(perfDom.stage, "HDF fetch/parse");
+            setPerfText(perfDom.stage, `HDF ${RuntimeState.cacheMode} fetch/parse`);
 
             return payload;
         },
@@ -1038,6 +1049,7 @@
             const bridge = await DataModule.waitForBaseScene(8000);
             const projectId = await DataModule.resolveProjectIdWithFallback();
             this.setRenderMode(DataModule.resolveRenderModeFromUrl());
+            RuntimeState.cacheMode = DataModule.resolveCacheModeFromUrl();
             RuntimeState.bridge = bridge;
             RuntimeState.projectId = projectId;
 
