@@ -51,6 +51,7 @@ coverage.xml
 # Project-local scratch / generated files
 resource/
 temp/
+excel/
 snippets.txt
 uv.lock
 

@@ -116,6 +116,7 @@
             backdrop-filter: blur(14px);
             box-shadow: 0 18px 42px rgba(0, 0, 0, 0.38);
             overflow: hidden;
+            pointer-events: auto;
         }
 
         .scene-side__head {
@@ -288,6 +289,11 @@
                 <div class="scene-side__row"><span>Draw Calls</span><strong id="perfDrawCalls">--</strong></div>
                 <div class="scene-side__row"><span>Triangles</span><strong id="perfTriangles">--</strong></div>
                 <div class="scene-side__row"><span>最近阶段</span><strong id="perfStage">--</strong></div>
+                <div class="scene-side__row">
+                    <span>结果写入</span>
+                    <button id="writeXnBtn" type="button" style="font:11px/1.2 Menlo,Consolas,monospace;padding:4px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.24);background:transparent;color:#dbe5ff;cursor:pointer;">写入 xn.xlsx</button>
+                </div>
+                <div class="scene-side__row"><span>写入状态</span><strong id="writeXnStatus">--</strong></div>
             </div>
         </aside>
     </div>
@@ -303,8 +309,8 @@
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-    <script src="/assets/js/three-empty.js?v=20260324-transport-mode-v3"></script>
-    <script src="/assets/js/three-hdf-overlay.js?v=20260324-hdf-cache-mode-v1"></script>
+    <script src="/assets/js/three-empty.js?v=20260329-colorfix-v1"></script>
+    <script src="/assets/js/three-hdf-overlay.js?v=20260329-hdf-on-v1"></script>
     <script>
         (function () {
             const params = new URLSearchParams(window.location.search);

@@ -2,10 +2,13 @@
     "use strict";
 
     const WATER_DEPTH_COLOR_GRADIENT = [
-        { t: 0.0, color: [36, 84, 173] },
-        { t: 0.35, color: [23, 162, 184] },
-        { t: 0.7, color: [56, 189, 136] },
-        { t: 1.0, color: [250, 204, 21] },
+        { t: 0.0, color: [205, 235, 255] },
+        { t: 0.18, color: [145, 205, 250] },
+        { t: 0.36, color: [90, 170, 240] },
+        { t: 0.54, color: [46, 128, 222] },
+        { t: 0.72, color: [24, 92, 190] },
+        { t: 0.88, color: [14, 58, 140] },
+        { t: 1.0, color: [8, 28, 88] },
     ];
 
     // Keep source XY in original world coordinates, but force-lift water surface by +100m in Z.
@@ -16,7 +19,12 @@
     const HDF_INITIAL_TIME_INDEX = 0;
     const HDF_INCLUDE_DRY_DEFAULT = false;
     const HDF_MIN_DEPTH_DEFAULT = 0.05;
-    const HDF_PLAY_INTERVAL_MS = 350;
+    const HDF_PLAY_INTERVAL_MS_DEFAULT = 80;
+    const HDF_PLAY_INTERVAL_MS_MIN = 16;
+    const HDF_PLAY_INTERVAL_MS_MAX = 1000;
+    const HDF_LOAD_ENABLED = true;
+    const AUTO_WRITE_WHEN_DRAWCALLS_EQ = 1;
+    const AUTO_WRITE_COOLDOWN_MS = 12000;
     const SURFACE_GRID_MIN = 96;
     const SURFACE_GRID_MAX = 320;
     const SURFACE_GRID_MAX_HIGH_DENSITY = 220;
@@ -33,7 +41,20 @@
         frontendFetch: document.getElementById("perfFrontendFetch"),
         frontendParse: document.getElementById("perfFrontendParse"),
         frontendRender: document.getElementById("perfFrontendRender"),
+        tti: document.getElementById("perfTTI"),
+        ttiInit: document.getElementById("perfTTIInit"),
+        ttiProject: document.getElementById("perfTTIProject"),
+        ttiMeta: document.getElementById("perfTTIMeta"),
+        ttiTiles: document.getElementById("perfTTITiles"),
+        ttiRebuild: document.getElementById("perfTTIRebuild"),
+        realtimeFps: document.getElementById("perfRealtimeFps"),
+        drawCalls: document.getElementById("perfDrawCalls"),
+        triangles: document.getElementById("perfTriangles"),
         stage: document.getElementById("perfStage"),
+    };
+    const exportDom = {
+        button: document.getElementById("writeXnBtn"),
+        status: document.getElementById("writeXnStatus"),
     };
 
     const setPerfText = (el, text) => {
@@ -43,6 +64,10 @@
     };
 
     const formatMs = (value) => `${Number(value).toFixed(1)} ms`;
+    const parseNumericText = (value) => {
+        const num = Number.parseFloat(String(value || "").replace(/[^\d.+-]/g, ""));
+        return Number.isFinite(num) ? num : null;
+    };
 
     const parseServerTiming = (headerValue) => {
         const result = { total: 0, gen: 0 };
@@ -75,12 +100,18 @@
         projectId: null,
         overlay: null,
         marker: null,
-        renderMode: RENDER_MODE_AUTO,
+        renderMode: RENDER_MODE_POINTS,
         cacheMode: "warm",
         isLoading: false,
         lastRequestId: 0,
         isPlaying: false,
         playbackTimerId: 0,
+        playbackIntervalMs: HDF_PLAY_INTERVAL_MS_DEFAULT,
+        lastPayload: null,
+        autoWriteTimerId: 0,
+        autoWriteInFlight: false,
+        lastAutoWriteAt: 0,
+        lastObservedDrawCalls: null,
     };
 
     /**
@@ -105,7 +136,7 @@
          * resolveRenderModeFromUrl
          * Function: Parse optional `hdf_mode` from URL.
          * Input: none.
-         * Output: `auto`, `surface`, or `points` (defaults to `auto`).
+         * Output: `auto`, `surface`, or `points` (defaults to `points`).
          */
         resolveRenderModeFromUrl() {
             const params = new URLSearchParams(window.location.search);
@@ -113,7 +144,7 @@
             if (rawMode === RENDER_MODE_AUTO || rawMode === RENDER_MODE_SURFACE || rawMode === RENDER_MODE_POINTS) {
                 return rawMode;
             }
-            return RENDER_MODE_AUTO;
+            return RENDER_MODE_POINTS;
         },
 
         resolveCacheModeFromUrl() {
@@ -123,6 +154,20 @@
                 return rawMode;
             }
             return "warm";
+        },
+
+        resolvePlaybackIntervalFromUrl() {
+            const params = new URLSearchParams(window.location.search);
+            const rawValue = Number(params.get("hdf_play_interval_ms"));
+            if (!Number.isFinite(rawValue)) {
+                return HDF_PLAY_INTERVAL_MS_DEFAULT;
+            }
+            const clamped = THREE.MathUtils.clamp(
+                Math.trunc(rawValue),
+                HDF_PLAY_INTERVAL_MS_MIN,
+                HDF_PLAY_INTERVAL_MS_MAX,
+            );
+            return clamped;
         },
 
         /**
@@ -319,7 +364,7 @@
                     "</div>",
                     "</div>",
                     "<div style=\"display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:10px;\">",
-                    "<span id=\"hdfRenderModeValue\" style=\"color:#9fb3e4;\">mode: auto</span>",
+                    "<span id=\"hdfRenderModeValue\" style=\"color:#9fb3e4;\">mode: points</span>",
                     "<div style=\"display:flex;gap:6px;\">",
                     "<button id=\"hdfModeAuto\" type=\"button\" style=\"font:11px/1.2 Menlo,Consolas,monospace;padding:4px 7px;border-radius:6px;border:1px solid rgba(255,255,255,.24);background:transparent;color:#dbe5ff;cursor:pointer;\">AUTO</button>",
                     "<button id=\"hdfModeSurface\" type=\"button\" style=\"font:11px/1.2 Menlo,Consolas,monospace;padding:4px 7px;border-radius:6px;border:1px solid rgba(255,255,255,.24);background:transparent;color:#dbe5ff;cursor:pointer;\">SURFACE</button>",
@@ -1004,6 +1049,7 @@
                 if (!RuntimeState.isPlaying) {
                     return;
                 }
+                const tickStartAt = performance.now();
                 const latestMax = Math.max(0, Math.trunc(TimelineModule.state.timeStepCount) - 1);
                 const latestCurrent = THREE.MathUtils.clamp(Math.trunc(TimelineModule.state.selectedTimeIndex), 0, latestMax);
                 if (latestCurrent >= latestMax) {
@@ -1020,14 +1066,16 @@
                     this.stopPlayback();
                     return;
                 }
+                const tickElapsedMs = performance.now() - tickStartAt;
+                const nextDelayMs = Math.max(0, RuntimeState.playbackIntervalMs - tickElapsedMs);
                 RuntimeState.playbackTimerId = window.setTimeout(() => {
                     void tick();
-                }, HDF_PLAY_INTERVAL_MS);
+                }, nextDelayMs);
             };
 
             RuntimeState.playbackTimerId = window.setTimeout(() => {
                 void tick();
-            }, HDF_PLAY_INTERVAL_MS);
+            }, 0);
         },
 
         /**
@@ -1041,7 +1089,7 @@
             const normalized = String(mode || "").toLowerCase();
             const nextMode = (normalized === RENDER_MODE_AUTO || normalized === RENDER_MODE_SURFACE || normalized === RENDER_MODE_POINTS)
                 ? normalized
-                : RENDER_MODE_AUTO;
+                : RENDER_MODE_POINTS;
 
             if (RuntimeState.renderMode === nextMode) {
                 return false;
@@ -1075,6 +1123,7 @@
 
                 DataModule.logPointSample(payload);
                 DiagnosticsModule.logSummary(payload);
+                RuntimeState.lastPayload = payload;
                 TimelineModule.createOrUpdateUi(payload.time_step_count, payload.time_index);
                 if (RuntimeState.isPlaying && payload.time_index >= payload.time_step_count - 1) {
                     this.stopPlayback();
@@ -1141,6 +1190,115 @@
             });
         },
 
+        async writeXnXlsxSnapshot() {
+            if (!RuntimeState.projectId) {
+                return;
+            }
+            RuntimeState.autoWriteInFlight = true;
+            if (exportDom.button) {
+                exportDom.button.disabled = true;
+                exportDom.button.style.opacity = "0.45";
+                exportDom.button.style.cursor = "not-allowed";
+            }
+            if (exportDom.status) {
+                exportDom.status.textContent = "写入中...";
+            }
+            const payload = RuntimeState.lastPayload && typeof RuntimeState.lastPayload === "object" ? RuntimeState.lastPayload : {};
+            const requestBody = {
+                project_id: Number(RuntimeState.projectId),
+                time_index: payload.time_index ?? TimelineModule.state.selectedTimeIndex,
+                time_step_count: payload.time_step_count ?? TimelineModule.state.timeStepCount,
+                point_count: payload.point_count ?? null,
+                render_mode: RuntimeState.renderMode,
+                cache_mode: RuntimeState.cacheMode,
+                playback_state: RuntimeState.isPlaying ? "playing" : "paused",
+                metrics: {
+                    data_gen_ms: parseNumericText(perfDom.dataGen && perfDom.dataGen.textContent),
+                    backend_transfer_ms: parseNumericText(perfDom.backendTransfer && perfDom.backendTransfer.textContent),
+                    frontend_fetch_ms: parseNumericText(perfDom.frontendFetch && perfDom.frontendFetch.textContent),
+                    frontend_parse_ms: parseNumericText(perfDom.frontendParse && perfDom.frontendParse.textContent),
+                    frontend_render_ms: parseNumericText(perfDom.frontendRender && perfDom.frontendRender.textContent),
+                    tti_ms: parseNumericText(perfDom.tti && perfDom.tti.textContent),
+                    tti_init_ms: parseNumericText(perfDom.ttiInit && perfDom.ttiInit.textContent),
+                    tti_project_ms: parseNumericText(perfDom.ttiProject && perfDom.ttiProject.textContent),
+                    tti_meta_ms: parseNumericText(perfDom.ttiMeta && perfDom.ttiMeta.textContent),
+                    tti_tiles_ms: parseNumericText(perfDom.ttiTiles && perfDom.ttiTiles.textContent),
+                    tti_rebuild_ms: parseNumericText(perfDom.ttiRebuild && perfDom.ttiRebuild.textContent),
+                    realtime_fps: parseNumericText(perfDom.realtimeFps && perfDom.realtimeFps.textContent),
+                    draw_calls: parseNumericText(perfDom.drawCalls && perfDom.drawCalls.textContent),
+                    triangles: parseNumericText(perfDom.triangles && perfDom.triangles.textContent),
+                    stage: perfDom.stage && perfDom.stage.textContent ? String(perfDom.stage.textContent) : "",
+                },
+            };
+            try {
+                const response = await fetch("/api/hdf/write-xn-xlsx", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        Accept: "application/json",
+                    },
+                    body: JSON.stringify(requestBody),
+                });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const result = await response.json();
+                if (exportDom.status) {
+                    exportDom.status.textContent = `已写入 ${result.path || "xn.xlsx"}`;
+                }
+            } catch (error) {
+                void error;
+                if (exportDom.status) {
+                    exportDom.status.textContent = "写入失败";
+                }
+            } finally {
+                RuntimeState.autoWriteInFlight = false;
+                if (exportDom.button) {
+                    exportDom.button.disabled = false;
+                    exportDom.button.style.opacity = "1";
+                    exportDom.button.style.cursor = "pointer";
+                }
+            }
+        },
+
+        bindAutoRecordWhenDrawCallsOne() {
+            if (!perfDom.drawCalls) {
+                return;
+            }
+            if (RuntimeState.autoWriteTimerId) {
+                window.clearInterval(RuntimeState.autoWriteTimerId);
+            }
+            RuntimeState.autoWriteTimerId = window.setInterval(() => {
+                const drawCallsValue = parseNumericText(perfDom.drawCalls && perfDom.drawCalls.textContent);
+                if (!Number.isFinite(drawCallsValue)) {
+                    RuntimeState.lastObservedDrawCalls = null;
+                    return;
+                }
+                const asInt = Math.trunc(drawCallsValue);
+                const now = Date.now();
+                const isEdgeToTarget = RuntimeState.lastObservedDrawCalls !== AUTO_WRITE_WHEN_DRAWCALLS_EQ && asInt === AUTO_WRITE_WHEN_DRAWCALLS_EQ;
+                const cooldownPassed = now - RuntimeState.lastAutoWriteAt >= AUTO_WRITE_COOLDOWN_MS;
+                RuntimeState.lastObservedDrawCalls = asInt;
+                if (!isEdgeToTarget || !cooldownPassed || RuntimeState.autoWriteInFlight) {
+                    return;
+                }
+                RuntimeState.lastAutoWriteAt = now;
+                if (exportDom.status) {
+                    exportDom.status.textContent = "DrawCalls=1，自动写入中...";
+                }
+                void this.writeXnXlsxSnapshot();
+            }, 900);
+        },
+
+        bindExportEvent() {
+            if (!exportDom.button) {
+                return;
+            }
+            exportDom.button.onclick = () => {
+                void this.writeXnXlsxSnapshot();
+            };
+        },
+
         /**
          * bindDebugShortcuts
          * 主要功能: 调试快捷键绑定的占位函数。
@@ -1161,10 +1319,23 @@
             const projectId = await DataModule.resolveProjectIdWithFallback();
             this.setRenderMode(DataModule.resolveRenderModeFromUrl());
             RuntimeState.cacheMode = DataModule.resolveCacheModeFromUrl();
+            RuntimeState.playbackIntervalMs = DataModule.resolvePlaybackIntervalFromUrl();
             RuntimeState.bridge = bridge;
             RuntimeState.projectId = projectId;
 
+            this.bindExportEvent();
+            this.bindAutoRecordWhenDrawCallsOne();
+            this.bindDebugShortcuts();
+
+            if (!HDF_LOAD_ENABLED) {
+                if (exportDom.status) {
+                    exportDom.status.textContent = "HDF已临时屏蔽；DrawCalls=1自动记录已开启";
+                }
+                return;
+            }
+
             const payload = await DataModule.fetchWaterDepthPayload(projectId, HDF_INITIAL_TIME_INDEX);
+            RuntimeState.lastPayload = payload;
             TimelineModule.createOrUpdateUi(payload.time_step_count, payload.time_index);
             DataModule.logPointSample(payload);
             DiagnosticsModule.logSummary(payload);
@@ -1172,8 +1343,6 @@
             this.bindTimelineEvent();
             this.bindRenderModeEvent();
             this.bindPlaybackEvent();
-            this.bindDebugShortcuts();
-
             if (!payload || !Array.isArray(payload.points) || payload.points.length === 0) {
                 return;
             }

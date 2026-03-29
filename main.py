@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import io
 from pathlib import Path
 from threading import Lock
 from time import perf_counter
 from typing import Any
+import zipfile
+from xml.etree import ElementTree
+from xml.sax.saxutils import escape as xml_escape
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Response as FastAPIResponse
 from fastapi.responses import HTMLResponse, Response
@@ -45,6 +49,225 @@ TIME_LABEL_REF = (
 	"Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/"
 	"Time Date Stamp"
 )
+XN_XLSX_PATH = BASE_DIR / "xn.xlsx"
+_XN_XLSX_LOCK = Lock()
+_XN_XLSX_HEADERS = [
+	"timestamp_utc",
+	"project_id",
+	"time_index",
+	"time_step_count",
+	"point_count",
+	"render_mode",
+	"cache_mode",
+	"playback_state",
+	"data_gen_ms",
+	"backend_transfer_ms",
+	"frontend_fetch_ms",
+	"frontend_parse_ms",
+	"frontend_render_ms",
+	"tti_ms",
+	"tti_init_ms",
+	"tti_project_ms",
+	"tti_meta_ms",
+	"tti_tiles_ms",
+	"tti_rebuild_ms",
+	"realtime_fps",
+	"draw_calls",
+	"triangles",
+	"stage",
+]
+
+
+def _xlsx_col_name(index: int) -> str:
+	letters = []
+	value = index
+	while value > 0:
+		value, remainder = divmod(value - 1, 26)
+		letters.append(chr(65 + remainder))
+	return "".join(reversed(letters))
+
+
+def _xlsx_is_number(value: Any) -> bool:
+	if isinstance(value, bool):
+		return False
+	if isinstance(value, int):
+		return True
+	if isinstance(value, float):
+		return np.isfinite(value)
+	return False
+
+
+def _xlsx_sheet_xml(rows: list[list[Any]]) -> str:
+	row_xml_parts: list[str] = []
+	for row_index, row_values in enumerate(rows, start=1):
+		cell_xml_parts: list[str] = []
+		for col_index, cell_value in enumerate(row_values, start=1):
+			if cell_value is None:
+				continue
+			cell_ref = f"{_xlsx_col_name(col_index)}{row_index}"
+			if _xlsx_is_number(cell_value):
+				cell_xml_parts.append(f"<c r=\"{cell_ref}\"><v>{cell_value}</v></c>")
+			else:
+				escaped = xml_escape(str(cell_value))
+				cell_xml_parts.append(f"<c r=\"{cell_ref}\" t=\"inlineStr\"><is><t>{escaped}</t></is></c>")
+		row_xml_parts.append(f"<row r=\"{row_index}\">{''.join(cell_xml_parts)}</row>")
+	return (
+		"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+		"<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+		"<sheetData>"
+		f"{''.join(row_xml_parts)}"
+		"</sheetData>"
+		"</worksheet>"
+	)
+
+
+def _xlsx_extract_rows(xlsx_path: Path) -> list[list[Any]]:
+	if not xlsx_path.exists():
+		return []
+	with zipfile.ZipFile(xlsx_path, "r") as zf:
+		sheet_xml = zf.read("xl/worksheets/sheet1.xml")
+	root = ElementTree.fromstring(sheet_xml)
+	rows: list[list[Any]] = []
+	for row_el in root.findall(".//{*}sheetData/{*}row"):
+		row_values: list[Any] = []
+		for cell_el in row_el.findall("{*}c"):
+			cell_ref = str(cell_el.get("r") or "")
+			col_letters = "".join(ch for ch in cell_ref if ch.isalpha())
+			col_index = 0
+			for ch in col_letters:
+				col_index = col_index * 26 + (ord(ch.upper()) - 64)
+			if col_index <= 0:
+				continue
+			while len(row_values) < col_index:
+				row_values.append("")
+			cell_type = cell_el.get("t")
+			if cell_type == "inlineStr":
+				text_node = cell_el.find(".//{*}t")
+				row_values[col_index - 1] = text_node.text if text_node is not None and text_node.text is not None else ""
+			else:
+				value_node = cell_el.find("{*}v")
+				row_values[col_index - 1] = value_node.text if value_node is not None and value_node.text is not None else ""
+		rows.append(row_values)
+	return rows
+
+
+def _xlsx_build_bytes(rows: list[list[Any]]) -> bytes:
+	sheet_xml = _xlsx_sheet_xml(rows)
+	workbook_xml = (
+		"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+		"<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+		"xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+		"<sheets><sheet name=\"xn\" sheetId=\"1\" r:id=\"rId1\"/></sheets>"
+		"</workbook>"
+	)
+	workbook_rels_xml = (
+		"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+		"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+		"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>"
+		"</Relationships>"
+	)
+	root_rels_xml = (
+		"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+		"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+		"<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>"
+		"<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/>"
+		"<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" Target=\"docProps/app.xml\"/>"
+		"</Relationships>"
+	)
+	content_types_xml = (
+		"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+		"<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+		"<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+		"<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+		"<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>"
+		"<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+		"<Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>"
+		"<Override PartName=\"/docProps/app.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.extended-properties+xml\"/>"
+		"</Types>"
+	)
+	now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+	core_xml = (
+		"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+		"<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" "
+		"xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
+		"xmlns:dcterms=\"http://purl.org/dc/terms/\" "
+		"xmlns:dcmitype=\"http://purl.org/dc/dcmitype/\" "
+		"xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">"
+		"<dc:creator>HECRAS-3D</dc:creator>"
+		"<cp:lastModifiedBy>HECRAS-3D</cp:lastModifiedBy>"
+		f"<dcterms:created xsi:type=\"dcterms:W3CDTF\">{now_iso}</dcterms:created>"
+		f"<dcterms:modified xsi:type=\"dcterms:W3CDTF\">{now_iso}</dcterms:modified>"
+		"</cp:coreProperties>"
+	)
+	app_xml = (
+		"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+		"<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\" "
+		"xmlns:vt=\"http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes\">"
+		"<Application>HECRAS-3D</Application>"
+		"</Properties>"
+	)
+	buffer = io.BytesIO()
+	with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+		zf.writestr("[Content_Types].xml", content_types_xml)
+		zf.writestr("_rels/.rels", root_rels_xml)
+		zf.writestr("xl/workbook.xml", workbook_xml)
+		zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+		zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+		zf.writestr("docProps/core.xml", core_xml)
+		zf.writestr("docProps/app.xml", app_xml)
+	return buffer.getvalue()
+
+
+def _append_xn_xlsx(payload: dict[str, Any]) -> int:
+	with _XN_XLSX_LOCK:
+		existing_rows = _xlsx_extract_rows(XN_XLSX_PATH)
+		if not existing_rows:
+			existing_rows = [list(_XN_XLSX_HEADERS)]
+		else:
+			existing_header = [str(cell) for cell in existing_rows[0]]
+			if existing_header != _XN_XLSX_HEADERS:
+				header_index = {name: idx for idx, name in enumerate(existing_header)}
+				normalized_rows: list[list[Any]] = [list(_XN_XLSX_HEADERS)]
+				for old_row in existing_rows[1:]:
+					normalized_row = []
+					for header_name in _XN_XLSX_HEADERS:
+						cell_idx = header_index.get(header_name, -1)
+						if cell_idx < 0 or cell_idx >= len(old_row):
+							normalized_row.append("")
+						else:
+							normalized_row.append(old_row[cell_idx])
+					normalized_rows.append(normalized_row)
+				existing_rows = normalized_rows
+		metrics = payload.get("metrics")
+		metrics_map = metrics if isinstance(metrics, dict) else {}
+		row = [
+			datetime.now(timezone.utc).isoformat(),
+			payload.get("project_id"),
+			payload.get("time_index"),
+			payload.get("time_step_count"),
+			payload.get("point_count"),
+			payload.get("render_mode"),
+			payload.get("cache_mode"),
+			payload.get("playback_state"),
+			metrics_map.get("data_gen_ms"),
+			metrics_map.get("backend_transfer_ms"),
+			metrics_map.get("frontend_fetch_ms"),
+			metrics_map.get("frontend_parse_ms"),
+			metrics_map.get("frontend_render_ms"),
+			metrics_map.get("tti_ms"),
+			metrics_map.get("tti_init_ms"),
+			metrics_map.get("tti_project_ms"),
+			metrics_map.get("tti_meta_ms"),
+			metrics_map.get("tti_tiles_ms"),
+			metrics_map.get("tti_rebuild_ms"),
+			metrics_map.get("realtime_fps"),
+			metrics_map.get("draw_calls"),
+			metrics_map.get("triangles"),
+			metrics_map.get("stage"),
+		]
+		existing_rows.append(row)
+		XN_XLSX_PATH.write_bytes(_xlsx_build_bytes(existing_rows))
+		return len(existing_rows) - 1
 
 
 def _compute_bbox_cover_ratio(
@@ -1417,3 +1640,13 @@ def get_project_hdf_water_depth(
 			f"water;dur={water_read_ms:.2f},filter;dur={filter_ms:.2f},sampling;dur={sampling_ms:.2f},points;dur={points_ms:.2f}"
 		)
 	return result
+
+
+@app.post("/api/hdf/write-xn-xlsx")
+def write_hdf_snapshot_to_xn_xlsx(payload: dict[str, Any]) -> dict[str, object]:
+	row_count = _append_xn_xlsx(payload)
+	return {
+		"ok": True,
+		"path": str(XN_XLSX_PATH.name),
+		"rows": row_count,
+	}

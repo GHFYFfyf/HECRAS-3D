@@ -3,12 +3,15 @@
 
     // Elevation gradient key points (t in [0,1]).
     // Colors are interpolated linearly between adjacent entries.
-    // Current palette: deep blue -> deep teal-green -> bright yellow -> light red.
     const ELEVATION_COLOR_GRADIENT = [
-        { t: 0.0, color: [18, 42, 120] },
-        { t: 0.2, color: [18, 110, 95] },
-        { t: 0.7, color: [255, 235, 59] },
-        { t: 1.0, color: [245, 130, 130] },
+        { t: 0.0, color: [38, 42, 48] },
+        { t: 0.12, color: [78, 84, 92] },
+        { t: 0.28, color: [78, 103, 120] },
+        { t: 0.46, color: [94, 132, 92] },
+        { t: 0.62, color: [155, 176, 96] },
+        { t: 0.76, color: [214, 196, 120] },
+        { t: 0.9, color: [190, 132, 88] },
+        { t: 1.0, color: [246, 236, 224] },
     ];
 
     const TILE_TARGET_POINTS = 18000;
@@ -1134,10 +1137,15 @@
 
         const meta = tileMeta.metadata || {};
         const zMid = Number(meta.z_mid);
+        const metaZMin = Number(meta.z_min);
+        const metaZMax = Number(meta.z_max);
         const bboxMinX = Number(meta.bbox_minx);
         const bboxMinY = Number(meta.bbox_miny);
         const bboxMaxX = Number(meta.bbox_maxx);
         const bboxMaxY = Number(meta.bbox_maxy);
+        let globalColorMinZ = Number.isFinite(metaZMin) ? metaZMin : Number.POSITIVE_INFINITY;
+        let globalColorMaxZ = Number.isFinite(metaZMax) ? metaZMax : Number.NEGATIVE_INFINITY;
+        let globalColorZRange = Math.max(globalColorMaxZ - globalColorMinZ, 1e-9);
 
         if (
             Number.isFinite(zMid)
@@ -1521,12 +1529,19 @@
                 return 0;
             }
 
-            const { minZ, zRange, centerX, centerY } = DataModule.computePointStats(mergedPoints);
+            const pointStats = DataModule.computePointStats(mergedPoints);
+            const centerX = pointStats.centerX;
+            const centerY = pointStats.centerY;
+            if (!Number.isFinite(globalColorMinZ) || !Number.isFinite(globalColorMaxZ)) {
+                globalColorMinZ = pointStats.minZ;
+                globalColorMaxZ = pointStats.maxZ;
+                globalColorZRange = Math.max(globalColorMaxZ - globalColorMinZ, 1e-9);
+            }
             const positions = DataModule.buildCenteredPositions(mergedPoints, centerX, centerY);
             const colors = new Float32Array(mergedPoints.length * 3);
             for (let i = 0; i < mergedPoints.length; i += 1) {
                 const z = Number(mergedPoints[i][2]);
-                const t = THREE.MathUtils.clamp((z - minZ) / Math.max(zRange, 1e-9), 0, 1);
+                const t = THREE.MathUtils.clamp((z - globalColorMinZ) / Math.max(globalColorZRange, 1e-9), 0, 1);
                 const [r, g, b] = MeshModule.sampleElevationRamp(t);
                 colors[i * 3] = r;
                 colors[i * 3 + 1] = g;
@@ -1551,7 +1566,14 @@
                 terrainSurface = null;
             }
 
-            terrainSurface = MeshModule.createIndexedSurfaceMesh(mergedVertices, centerX, centerY, minZ, zRange, sampleStep);
+            terrainSurface = MeshModule.createIndexedSurfaceMesh(
+                mergedVertices,
+                centerX,
+                centerY,
+                globalColorMinZ,
+                globalColorZRange,
+                sampleStep,
+            );
             if (terrainSurface) {
                 RenderModule.scene.add(terrainSurface);
             }
@@ -1564,9 +1586,9 @@
                 ready: true,
                 centerX: 0,
                 centerY: 0,
-                minZ,
-                maxZ: minZ + zRange,
-                zRange,
+                minZ: globalColorMinZ,
+                maxZ: globalColorMaxZ,
+                zRange: globalColorZRange,
             };
 
             if (firstRenderable) {
