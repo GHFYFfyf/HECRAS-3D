@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import h5py
@@ -65,9 +65,9 @@ def main() -> None:
         face_count = int(hdf[FACE_VELOCITY_REF].shape[1])
         time_step_count = int(hdf[WATER_SURFACE_REF].shape[0])
 
-    now = datetime.now(UTC)
-    hdf_mtime = datetime.fromtimestamp(hdf_file.stat().st_mtime, UTC)
-    tif_mtime = datetime.fromtimestamp(tif_file.stat().st_mtime, UTC)
+    now = datetime.now(timezone.utc)
+    hdf_mtime = datetime.fromtimestamp(hdf_file.stat().st_mtime, timezone.utc)
+    tif_mtime = datetime.fromtimestamp(tif_file.stat().st_mtime, timezone.utc)
 
     Base.metadata.create_all(bind=engine)
 

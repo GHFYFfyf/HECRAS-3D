@@ -13,6 +13,10 @@
     const DEPTH_Z_LIFT_FACTOR = 0.0;
     const WATER_FORCED_Z_LIFT = 0.0;
     const MAX_POINTS_QUERY = 80000;
+    const HDF_INITIAL_TIME_INDEX = 0;
+    const HDF_INCLUDE_DRY_DEFAULT = false;
+    const HDF_MIN_DEPTH_DEFAULT = 0.05;
+    const HDF_PLAY_INTERVAL_MS = 350;
     const SURFACE_GRID_MIN = 96;
     const SURFACE_GRID_MAX = 320;
     const SURFACE_GRID_MAX_HIGH_DENSITY = 220;
@@ -75,6 +79,8 @@
         cacheMode: "warm",
         isLoading: false,
         lastRequestId: 0,
+        isPlaying: false,
+        playbackTimerId: 0,
     };
 
     /**
@@ -191,12 +197,12 @@
          * Output: Promise<{points, time_index, time_step_count, ...}>.
          */
         async fetchWaterDepthPayload(projectId, timeIndex) {
-            const safeTimeIndex = Number.isInteger(timeIndex) ? timeIndex : -1;
+            const safeTimeIndex = Number.isInteger(timeIndex) ? timeIndex : HDF_INITIAL_TIME_INDEX;
             console.log("[hdf-water-depth] request time_index", safeTimeIndex);
             const fetchStartAt = performance.now();
             const useCache = RuntimeState.cacheMode !== "cold";
             const response = await fetch(
-                `/api/projects/${encodeURIComponent(projectId)}/hdf-water-depth?time_index=${encodeURIComponent(safeTimeIndex)}&max_points=${MAX_POINTS_QUERY}&include_dry=true&use_cache=${useCache ? "true" : "false"}`,
+                `/api/projects/${encodeURIComponent(projectId)}/hdf-water-depth?time_index=${encodeURIComponent(safeTimeIndex)}&max_points=${MAX_POINTS_QUERY}&include_dry=${HDF_INCLUDE_DRY_DEFAULT ? "true" : "false"}&min_depth=${encodeURIComponent(HDF_MIN_DEPTH_DEFAULT)}&use_cache=${useCache ? "true" : "false"}`,
                 { headers: { Accept: "application/json" } },
             );
             if (!response.ok) {
@@ -273,6 +279,9 @@
             let autoButton = document.getElementById("hdfModeAuto");
             let surfaceButton = document.getElementById("hdfModeSurface");
             let pointsButton = document.getElementById("hdfModePoints");
+            let playStatusText = document.getElementById("hdfPlaybackStatus");
+            let playButton = document.getElementById("hdfPlayButton");
+            let pauseButton = document.getElementById("hdfPauseButton");
 
             if (!root) {
                 root = document.createElement("div");
@@ -303,6 +312,13 @@
                     "<span id=\"hdfTimelineMax\">0</span>",
                     "</div>",
                     "<div style=\"display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:10px;\">",
+                    "<span id=\"hdfPlaybackStatus\" style=\"color:#9fb3e4;\">playback: paused</span>",
+                    "<div style=\"display:flex;gap:6px;\">",
+                    "<button id=\"hdfPlayButton\" type=\"button\" style=\"font:11px/1.2 Menlo,Consolas,monospace;padding:4px 7px;border-radius:6px;border:1px solid rgba(255,255,255,.24);background:transparent;color:#dbe5ff;cursor:pointer;\">PLAY</button>",
+                    "<button id=\"hdfPauseButton\" type=\"button\" style=\"font:11px/1.2 Menlo,Consolas,monospace;padding:4px 7px;border-radius:6px;border:1px solid rgba(255,255,255,.24);background:transparent;color:#dbe5ff;cursor:pointer;\">PAUSE</button>",
+                    "</div>",
+                    "</div>",
+                    "<div style=\"display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:10px;\">",
                     "<span id=\"hdfRenderModeValue\" style=\"color:#9fb3e4;\">mode: auto</span>",
                     "<div style=\"display:flex;gap:6px;\">",
                     "<button id=\"hdfModeAuto\" type=\"button\" style=\"font:11px/1.2 Menlo,Consolas,monospace;padding:4px 7px;border-radius:6px;border:1px solid rgba(255,255,255,.24);background:transparent;color:#dbe5ff;cursor:pointer;\">AUTO</button>",
@@ -322,9 +338,24 @@
                 autoButton = document.getElementById("hdfModeAuto");
                 surfaceButton = document.getElementById("hdfModeSurface");
                 pointsButton = document.getElementById("hdfModePoints");
+                playStatusText = document.getElementById("hdfPlaybackStatus");
+                playButton = document.getElementById("hdfPlayButton");
+                pauseButton = document.getElementById("hdfPauseButton");
             }
 
-            if (!slider || !valueText || !minText || !maxText || !modeText || !autoButton || !surfaceButton || !pointsButton) {
+            if (
+                !slider
+                || !valueText
+                || !minText
+                || !maxText
+                || !modeText
+                || !autoButton
+                || !surfaceButton
+                || !pointsButton
+                || !playStatusText
+                || !playButton
+                || !pauseButton
+            ) {
                 return;
             }
 
@@ -345,9 +376,20 @@
             applyButtonState(autoButton, RuntimeState.renderMode === RENDER_MODE_AUTO);
             applyButtonState(surfaceButton, RuntimeState.renderMode === RENDER_MODE_SURFACE);
             applyButtonState(pointsButton, RuntimeState.renderMode === RENDER_MODE_POINTS);
+            const reachedEnd = safeSelected >= maxIndex;
+            playStatusText.textContent = `playback: ${RuntimeState.isPlaying ? "playing" : "paused"}`;
+            playButton.disabled = RuntimeState.isPlaying || reachedEnd;
+            pauseButton.disabled = !RuntimeState.isPlaying;
+            playButton.style.opacity = playButton.disabled ? "0.45" : "1";
+            pauseButton.style.opacity = pauseButton.disabled ? "0.45" : "1";
+            playButton.style.cursor = playButton.disabled ? "not-allowed" : "pointer";
+            pauseButton.style.cursor = pauseButton.disabled ? "not-allowed" : "pointer";
 
             slider.oninput = () => {
                 const nextIndex = THREE.MathUtils.clamp(Number(slider.value) || 0, 0, maxIndex);
+                if (RuntimeState.isPlaying) {
+                    window.dispatchEvent(new CustomEvent("hdf-pause-request"));
+                }
                 this.state.selectedTimeIndex = nextIndex;
                 valueText.textContent = `t = ${nextIndex}`;
             };
@@ -371,6 +413,12 @@
             };
             pointsButton.onclick = () => {
                 window.dispatchEvent(new CustomEvent("hdf-render-mode-changed", { detail: { mode: RENDER_MODE_POINTS } }));
+            };
+            playButton.onclick = () => {
+                window.dispatchEvent(new CustomEvent("hdf-play-request"));
+            };
+            pauseButton.onclick = () => {
+                window.dispatchEvent(new CustomEvent("hdf-pause-request"));
             };
         },
     };
@@ -934,6 +982,54 @@
      * Flow: bootstrap -> bind listeners -> fetch frame -> render overlay.
      */
     const RuntimeModule = {
+        stopPlayback() {
+            if (RuntimeState.playbackTimerId) {
+                window.clearTimeout(RuntimeState.playbackTimerId);
+            }
+            RuntimeState.playbackTimerId = 0;
+            RuntimeState.isPlaying = false;
+            TimelineModule.createOrUpdateUi(TimelineModule.state.timeStepCount, TimelineModule.state.selectedTimeIndex);
+        },
+
+        startPlayback() {
+            const maxIndex = Math.max(0, Math.trunc(TimelineModule.state.timeStepCount) - 1);
+            const currentIndex = THREE.MathUtils.clamp(Math.trunc(TimelineModule.state.selectedTimeIndex), 0, maxIndex);
+            if (RuntimeState.isPlaying || currentIndex >= maxIndex) {
+                return;
+            }
+            RuntimeState.isPlaying = true;
+            TimelineModule.createOrUpdateUi(TimelineModule.state.timeStepCount, TimelineModule.state.selectedTimeIndex);
+
+            const tick = async () => {
+                if (!RuntimeState.isPlaying) {
+                    return;
+                }
+                const latestMax = Math.max(0, Math.trunc(TimelineModule.state.timeStepCount) - 1);
+                const latestCurrent = THREE.MathUtils.clamp(Math.trunc(TimelineModule.state.selectedTimeIndex), 0, latestMax);
+                if (latestCurrent >= latestMax) {
+                    this.stopPlayback();
+                    return;
+                }
+                await this.loadAndRenderTimeIndex(latestCurrent + 1);
+                if (!RuntimeState.isPlaying) {
+                    return;
+                }
+                const afterMax = Math.max(0, Math.trunc(TimelineModule.state.timeStepCount) - 1);
+                const afterCurrent = THREE.MathUtils.clamp(Math.trunc(TimelineModule.state.selectedTimeIndex), 0, afterMax);
+                if (afterCurrent >= afterMax) {
+                    this.stopPlayback();
+                    return;
+                }
+                RuntimeState.playbackTimerId = window.setTimeout(() => {
+                    void tick();
+                }, HDF_PLAY_INTERVAL_MS);
+            };
+
+            RuntimeState.playbackTimerId = window.setTimeout(() => {
+                void tick();
+            }, HDF_PLAY_INTERVAL_MS);
+        },
+
         /**
          * setRenderMode
          * 主要功能: 规范化并应用渲染模式（auto/surface/points）。
@@ -980,6 +1076,9 @@
                 DataModule.logPointSample(payload);
                 DiagnosticsModule.logSummary(payload);
                 TimelineModule.createOrUpdateUi(payload.time_step_count, payload.time_index);
+                if (RuntimeState.isPlaying && payload.time_index >= payload.time_step_count - 1) {
+                    this.stopPlayback();
+                }
 
                 if (!payload || !Array.isArray(payload.points) || payload.points.length === 0) {
                     return;
@@ -988,6 +1087,9 @@
                 OverlayModule.createOrUpdateWaterDepthOverlay(RuntimeState.bridge, payload);
             } catch (error) {
                 void error;
+                if (RuntimeState.isPlaying) {
+                    this.stopPlayback();
+                }
             } finally {
                 RuntimeState.isLoading = false;
             }
@@ -1030,6 +1132,15 @@
             });
         },
 
+        bindPlaybackEvent() {
+            window.addEventListener("hdf-play-request", () => {
+                this.startPlayback();
+            });
+            window.addEventListener("hdf-pause-request", () => {
+                this.stopPlayback();
+            });
+        },
+
         /**
          * bindDebugShortcuts
          * 主要功能: 调试快捷键绑定的占位函数。
@@ -1053,13 +1164,14 @@
             RuntimeState.bridge = bridge;
             RuntimeState.projectId = projectId;
 
-            const payload = await DataModule.fetchWaterDepthPayload(projectId, -1);
+            const payload = await DataModule.fetchWaterDepthPayload(projectId, HDF_INITIAL_TIME_INDEX);
             TimelineModule.createOrUpdateUi(payload.time_step_count, payload.time_index);
             DataModule.logPointSample(payload);
             DiagnosticsModule.logSummary(payload);
 
             this.bindTimelineEvent();
             this.bindRenderModeEvent();
+            this.bindPlaybackEvent();
             this.bindDebugShortcuts();
 
             if (!payload || !Array.isArray(payload.points) || payload.points.length === 0) {

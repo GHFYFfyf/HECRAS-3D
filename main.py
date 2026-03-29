@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from time import perf_counter
@@ -567,9 +567,9 @@ def create_project(
 	except Exception as e:
 		raise HTTPException(status_code=400, detail=f"HDF文件读取错误: {e}")
 
-	now = datetime.now(UTC)
-	hdf_mtime = datetime.fromtimestamp(hdf_file.stat().st_mtime, UTC)
-	tif_mtime = datetime.fromtimestamp(tif_file.stat().st_mtime, UTC)
+	now = datetime.now(timezone.utc)
+	hdf_mtime = datetime.fromtimestamp(hdf_file.stat().st_mtime, timezone.utc)
+	tif_mtime = datetime.fromtimestamp(tif_file.stat().st_mtime, timezone.utc)
 
 	project = Project(
 		name=request.name,
@@ -1230,9 +1230,10 @@ def get_project_tif_tile_points_binary(
 @app.get("/api/projects/{project_id}/hdf-water-depth")
 def get_project_hdf_water_depth(
 	project_id: int,
-	time_index: int = Query(default=-1, ge=-1),
+	time_index: int = Query(default=0, ge=-1),
 	max_points: int = Query(default=80000, ge=1000, le=300000),
 	include_dry: bool = Query(default=False),
+	min_depth: float = Query(default=0.05, ge=0.0, le=1000.0),
 	use_cache: bool = Query(default=True),
 	response: FastAPIResponse = None,
 	db: Session = Depends(get_db),
@@ -1313,7 +1314,7 @@ def get_project_hdf_water_depth(
 	if include_dry:
 		valid_mask = finite_mask
 	else:
-		valid_mask = finite_mask & (depth > 0.0)
+		valid_mask = finite_mask & (depth > min_depth)
 
 	valid_indices = np.flatnonzero(valid_mask)
 	valid_count = int(valid_indices.size)
@@ -1332,6 +1333,8 @@ def get_project_hdf_water_depth(
 				"cell_center_ref": cell_center_ref,
 				"bed_elevation_ref": bed_elevation_ref,
 				"water_surface_ref": water_surface_ref,
+				"include_dry": include_dry,
+				"min_depth": float(min_depth),
 			},
 			"points": [],
 		}
@@ -1395,6 +1398,8 @@ def get_project_hdf_water_depth(
 			"cell_center_ref": cell_center_ref,
 			"bed_elevation_ref": bed_elevation_ref,
 			"water_surface_ref": water_surface_ref,
+			"include_dry": include_dry,
+			"min_depth": float(min_depth),
 		},
 		"timings": {
 			"total_ms": float(total_ms),
