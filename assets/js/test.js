@@ -294,23 +294,24 @@ document.addEventListener("DOMContentLoaded", async () => {
                     splitLine: { lineStyle: { color: "rgba(123,166,202,0.16)" } },
                 },
                 series: [{ type: "line", data: [] }],
-                graphic: {
-                    type: "text",
-                    left: "center",
-                    top: "middle",
-                    style: {
-                        text: "未检测到上游流量曲线",
-                        fill: "#7ba6ca",
-                        fontSize: 11,
-                    }
-                }
-            });
+                dataZoom: [],
+            }, { notMerge: true });
             requestChartsResize();
             return;
         }
 
         setStatsText("statsFlowPeak", formatFlow(Number(flowPayload.peak_flow)));
         setStatsText("statsFlowCurrent", formatFlow(Number(flowPayload.current_flow)));
+
+        const flowSeries = flowPayload.series
+            .map((item) => [Number(item[0]), Number(item[1])])
+            .filter((item) => Number.isFinite(item[0]) && Number.isFinite(item[1]));
+        const fixedWindowHours = 12;
+        const lastHour = flowSeries.length > 0 ? Number(flowSeries[flowSeries.length - 1][0]) : 0;
+        const axisMaxHour = Math.max(fixedWindowHours, Math.ceil(Number.isFinite(lastHour) ? lastHour : 0));
+        const enableZoom = axisMaxHour > fixedWindowHours;
+        const zoomEndValue = axisMaxHour;
+        const zoomStartValue = Math.max(0, zoomEndValue - fixedWindowHours);
 
         flowChart.setOption({
             animationDuration: 450,
@@ -320,16 +321,28 @@ document.addEventListener("DOMContentLoaded", async () => {
                 backgroundColor: "rgba(8,18,34,0.92)",
                 borderColor: "rgba(100,219,178,0.45)",
                 textStyle: { color: "#d8ebff", fontSize: 10 },
-                valueFormatter: (value) => `${Number(value).toFixed(2)} m3/s`
+                formatter: (params) => {
+                    const item = Array.isArray(params) ? params[0] : params;
+                    if (!item || !Array.isArray(item.value)) {
+                        return "";
+                    }
+                    const hour = Number(item.value[0]);
+                    const flow = Number(item.value[1]);
+                    return `时间: ${Math.round(hour)} h<br/>流量: ${flow.toFixed(2)} m3/s`;
+                }
             },
-            grid: { left: 14, right: 8, top: 14, bottom: 18, containLabel: true },
+            grid: { left: 14, right: 8, top: 14, bottom: enableZoom ? 34 : 18, containLabel: true },
             xAxis: {
                 type: "value",
+                min: 0,
+                max: axisMaxHour,
+                minInterval: 1,
+                interval: 1,
                 axisLine: { lineStyle: { color: "rgba(108,212,188,0.36)" } },
                 axisLabel: {
                     color: "#81d7c4",
                     fontSize: 9,
-                    formatter: (value) => Number(value).toFixed(2)
+                    formatter: (value) => `${Math.round(Number(value))} h`
                 },
                 splitLine: { lineStyle: { color: "rgba(123,166,202,0.12)" } },
             },
@@ -344,7 +357,7 @@ document.addEventListener("DOMContentLoaded", async () => {
                 type: "line",
                 smooth: true,
                 showSymbol: false,
-                data: flowPayload.series,
+                data: flowSeries,
                 lineStyle: {
                     width: 2,
                     color: "#3ad2aa",
@@ -353,8 +366,28 @@ document.addEventListener("DOMContentLoaded", async () => {
                     color: "rgba(58,210,170,0.2)",
                 },
             }],
-            graphic: null,
-        });
+            dataZoom: enableZoom ? [
+                {
+                    type: "slider",
+                    xAxisIndex: 0,
+                    filterMode: "none",
+                    zoomLock: true,
+                    brushSelect: false,
+                    height: 12,
+                    bottom: 6,
+                    startValue: zoomStartValue,
+                    endValue: zoomEndValue,
+                    minValueSpan: fixedWindowHours,
+                    maxValueSpan: fixedWindowHours,
+                    borderColor: "rgba(84,140,126,0.42)",
+                    backgroundColor: "rgba(8,24,20,0.38)",
+                    fillerColor: "rgba(52,169,139,0.3)",
+                    handleSize: 12,
+                    moveHandleSize: 16,
+                    textStyle: { color: "#8ecfbf", fontSize: 9 },
+                },
+            ] : [],
+        }, { notMerge: true });
         requestChartsResize();
     }
 
@@ -446,7 +479,12 @@ document.addEventListener("DOMContentLoaded", async () => {
         setStatsText("statsPointCount", validCount.toLocaleString("zh-CN"));
         setStatsText("statsAvgDepth", `${avgDepth.toFixed(2)} m`);
         setStatsText("statsMaxDepth", `${(Number.isFinite(maxDepth) ? maxDepth : 0).toFixed(2)} m`);
-        setStatsText("statsFloodArea", formatArea(gridSummary?.floodArea ?? 0));
+        const payloadFloodArea = Number(payload?.flood_area_square_meter);
+        const summaryFloodArea = Number(gridSummary?.floodArea);
+        const floodArea = Number.isFinite(payloadFloodArea)
+            ? payloadFloodArea
+            : (Number.isFinite(summaryFloodArea) ? summaryFloodArea : 0);
+        setStatsText("statsFloodArea", formatArea(floodArea));
         const depthBins = buildDepthBins(points);
         const velocityFaces = Array.isArray(payload?.velocity_faces) ? payload.velocity_faces : [];
         updateDepthChart(depthBins);

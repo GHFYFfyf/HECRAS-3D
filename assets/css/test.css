@@ -63,14 +63,12 @@ body.modal-open > main {
 }
 
 .hydro-panel {
-    background:
-        radial-gradient(120% 130% at 4% -28%, rgba(36, 151, 255, 0.17) 0%, rgba(6, 18, 35, 0.06) 36%, rgba(2, 6, 12, 0.18) 100%),
-        linear-gradient(180deg, rgba(8, 15, 26, 0.84) 0%, rgba(4, 8, 16, 0.9) 100%);
+    background: #06080b;
 }
 
 .hydro-kicker {
     display: inline-block;
-    color: #6fb4ff;
+    color: #b8c0cb;
     font-size: 10px;
     letter-spacing: 0.14em;
     text-transform: uppercase;
@@ -78,7 +76,7 @@ body.modal-open > main {
 
 .hydro-title {
     margin: 0.18rem 0 0;
-    color: #dbeeff;
+    color: #e7ecf3;
     font-size: 14px;
     font-weight: 600;
     letter-spacing: 0.02em;
@@ -86,16 +84,16 @@ body.modal-open > main {
 
 .chart-shell {
     min-width: 0;
-    border: 1px solid rgba(103, 187, 255, 0.2);
+    border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 0.6rem;
-    background: linear-gradient(180deg, rgba(8, 18, 31, 0.82) 0%, rgba(5, 11, 21, 0.84) 100%);
+    background: rgba(10, 12, 15, 0.92);
     padding: 0.45rem 0.55rem 0.3rem;
     display: flex;
     flex-direction: column;
 }
 
 .chart-shell__title {
-    color: #98c9f7;
+    color: #a8b2be;
     font-size: 10px;
     letter-spacing: 0.08em;
     text-transform: uppercase;
@@ -302,17 +300,17 @@ button.action-pill:hover,
     gap: 0.16rem;
     padding: 0.42rem 0.5rem;
     border-radius: 0.5rem;
-    border: 1px solid rgba(103, 187, 255, 0.22);
-    background: linear-gradient(180deg, rgba(8, 22, 38, 0.76) 0%, rgba(4, 12, 24, 0.8) 100%);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: rgba(7, 11, 17, 0.92);
 }
 
 .stats-pill__label {
-    color: #7ba6ca;
+    color: #aeb8c4;
     letter-spacing: 0.04em;
 }
 
 .stats-pill__value {
-    color: #d8ebff;
+    color: #eef3fa;
     font-size: 11px;
     font-weight: 600;
 }

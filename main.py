@@ -30,7 +30,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 
 _HDF_STATIC_CACHE_LOCK = Lock()
-_HDF_STATIC_CACHE: dict[tuple[str, int, str, str, str], dict[str, Any]] = {}
+_HDF_STATIC_CACHE: dict[tuple[str, int, str, str, str, str], dict[str, Any]] = {}
 _HDF_FACE_GEOMETRY_CACHE: dict[tuple[str, int, str, str], dict[str, Any]] = {}
 
 CELL_CENTER_REF = "Geometry/2D Flow Areas/Perimeter 1/Cells Center Coordinate"
@@ -39,6 +39,7 @@ WATER_SURFACE_REF = (
 	"Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/"
 	"2D Flow Areas/Perimeter 1/Water Surface"
 )
+CELL_SURFACE_AREA_REF = "Geometry/2D Flow Areas/Perimeter 1/Cells Surface Area"
 FACE_POINT_COORDINATE_REF = "Geometry/2D Flow Areas/Perimeter 1/FacePoints Coordinate"
 FACE_POINT_INDEXES_REF = "Geometry/2D Flow Areas/Perimeter 1/Faces FacePoint Indexes"
 FACE_VELOCITY_REF = (
@@ -351,6 +352,7 @@ def _get_hdf_static_data(
 	cell_center_ref: str,
 	bed_elevation_ref: str,
 	water_surface_ref: str,
+	cell_surface_area_ref: str | None = None,
 	use_cache: bool = True,
 ) -> dict[str, Any]:
 	cache_key = None
@@ -362,6 +364,7 @@ def _get_hdf_static_data(
 			cell_center_ref,
 			bed_elevation_ref,
 			water_surface_ref,
+			cell_surface_area_ref or "",
 		)
 		with _HDF_STATIC_CACHE_LOCK:
 			cached = _HDF_STATIC_CACHE.get(cache_key)
@@ -379,6 +382,11 @@ def _get_hdf_static_data(
 		coords = np.asarray(hdf[cell_center_ref][:], dtype=np.float32)
 		bed = np.asarray(hdf[bed_elevation_ref][:], dtype=np.float32)
 		water_surface_ds = hdf[water_surface_ref]
+		cell_surface_area = None
+		if cell_surface_area_ref and cell_surface_area_ref in hdf:
+			cell_surface_area_raw = np.asarray(hdf[cell_surface_area_ref][:], dtype=np.float32)
+			if cell_surface_area_raw.ndim == 1 and int(cell_surface_area_raw.shape[0]) == int(coords.shape[0]):
+				cell_surface_area = cell_surface_area_raw
 
 		if coords.ndim != 2 or coords.shape[1] < 2:
 			raise HTTPException(status_code=400, detail="Invalid cell center coordinates shape")
@@ -395,6 +403,7 @@ def _get_hdf_static_data(
 		static_data = {
 			"coords": coords,
 			"bed": bed,
+			"cell_surface_area": cell_surface_area,
 			"cell_count": cell_count,
 			"time_step_count": time_step_count,
 		}
@@ -564,6 +573,28 @@ def _resolve_project_flow_source(project_hdf_path: Path) -> tuple[Path | None, s
 	return None, None, None
 
 
+def _normalize_time_axis_to_hours(raw_time_values: np.ndarray) -> np.ndarray:
+	if raw_time_values.size == 0:
+		return raw_time_values
+	relative = raw_time_values - float(raw_time_values[0])
+	if relative.size <= 1:
+		return np.zeros_like(relative, dtype=np.float64)
+	diffs = np.diff(relative)
+	valid_diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+	if valid_diffs.size == 0:
+		return np.arange(relative.size, dtype=np.float64)
+	median_step = float(np.median(valid_diffs))
+	if median_step < 0.2:
+		scale_to_hour = 24.0
+	elif median_step > 1200.0:
+		scale_to_hour = 1.0 / 3600.0
+	elif median_step > 5.0:
+		scale_to_hour = 1.0 / 60.0
+	else:
+		scale_to_hour = 1.0
+	return relative * scale_to_hour
+
+
 def _extract_flow_hydrograph_series(
 	*,
 	hdf_path: Path,
@@ -600,17 +631,44 @@ def _extract_flow_hydrograph_series(
 	if flow_values.size == 0:
 		raise HTTPException(status_code=400, detail="Flow hydrograph dataset is empty after filtering")
 
-	peak_index = int(np.argmax(flow_values))
+	time_hours = _normalize_time_axis_to_hours(time_values)
+	order = np.argsort(time_hours)
+	time_hours = time_hours[order]
+	flow_values = flow_values[order]
+
+	# Keep monotonic x-axis for interpolation by dropping duplicate time samples.
+	rounded_hours = np.round(time_hours, decimals=9)
+	_, unique_indices = np.unique(rounded_hours, return_index=True)
+	time_hours = time_hours[unique_indices]
+	flow_values = flow_values[unique_indices]
+	if flow_values.size == 0:
+		raise HTTPException(status_code=400, detail="Flow hydrograph dataset has no unique time samples")
+
+	if time_hours.size > 1:
+		max_hour = float(time_hours[-1])
+		hour_grid = np.arange(0.0, np.floor(max_hour) + 1.0, 1.0, dtype=np.float64)
+		if hour_grid.size == 0:
+			hour_grid = np.array([0.0], dtype=np.float64)
+		if float(hour_grid[-1]) < max_hour:
+			hour_grid = np.append(hour_grid, np.ceil(max_hour))
+		flow_hourly = np.interp(hour_grid, time_hours, flow_values)
+	else:
+		hour_grid = np.array([0.0], dtype=np.float64)
+		flow_hourly = np.array([float(flow_values[0])], dtype=np.float64)
+
+	peak_index = int(np.argmax(flow_hourly))
 	return {
-		"sample_count": int(flow_values.size),
-		"peak_flow": float(flow_values[peak_index]),
-		"peak_time": float(time_values[peak_index]),
-		"current_flow": float(flow_values[-1]),
-		"current_time": float(time_values[-1]),
-		"avg_flow": float(np.mean(flow_values)),
+		"sample_count": int(flow_hourly.size),
+		"time_unit": "hour",
+		"time_interval_hour": 1,
+		"peak_flow": float(flow_hourly[peak_index]),
+		"peak_time": float(hour_grid[peak_index]),
+		"current_flow": float(flow_hourly[-1]),
+		"current_time": float(hour_grid[-1]),
+		"avg_flow": float(np.mean(flow_hourly)),
 		"series": [
 			[float(t), float(q)]
-			for t, q in zip(time_values, flow_values, strict=False)
+			for t, q in zip(hour_grid, flow_hourly, strict=False)
 		],
 	}
 
@@ -1782,12 +1840,14 @@ def get_project_hdf_water_depth(
 	face_point_coordinate_ref = project.face_point_coordinate_ref or FACE_POINT_COORDINATE_REF
 	face_point_indexes_ref = project.face_point_indexes_ref or FACE_POINT_INDEXES_REF
 	face_velocity_ref = project.face_velocity_ref or FACE_VELOCITY_REF
+	cell_surface_area_ref = CELL_SURFACE_AREA_REF
 
 	static_data = _get_hdf_static_data(
 		hdf_path=hdf_path,
 		cell_center_ref=cell_center_ref,
 		bed_elevation_ref=bed_elevation_ref,
 		water_surface_ref=water_surface_ref,
+		cell_surface_area_ref=cell_surface_area_ref,
 		use_cache=use_cache,
 	)
 	face_geometry_data = _get_hdf_face_geometry_data(
@@ -1799,6 +1859,7 @@ def get_project_hdf_water_depth(
 	t_cache_ready = perf_counter()
 	coords = static_data["coords"]
 	bed = static_data["bed"]
+	cell_surface_area = static_data.get("cell_surface_area")
 	cell_count = int(static_data["cell_count"])
 	time_step_count = int(static_data["time_step_count"])
 	face_centers_xy = face_geometry_data["face_centers_xy"]
@@ -1818,10 +1879,12 @@ def get_project_hdf_water_depth(
 				"cell_center_ref": cell_center_ref,
 				"bed_elevation_ref": bed_elevation_ref,
 				"water_surface_ref": water_surface_ref,
+				"cell_surface_area_ref": cell_surface_area_ref,
 				"face_point_coordinate_ref": face_point_coordinate_ref,
 				"face_point_indexes_ref": face_point_indexes_ref,
 				"face_velocity_ref": face_velocity_ref,
 			},
+			"flood_area_square_meter": 0.0,
 			"velocity_face_count": 0,
 			"velocity_faces": [],
 			"points": [],
@@ -1874,8 +1937,18 @@ def get_project_hdf_water_depth(
 	else:
 		valid_mask = finite_mask & (depth > min_depth)
 
+	wet_mask = finite_mask & (depth > min_depth)
+
 	valid_indices = np.flatnonzero(valid_mask)
+	wet_indices = np.flatnonzero(wet_mask)
 	valid_count = int(valid_indices.size)
+	flood_area_square_meter = 0.0
+	if isinstance(cell_surface_area, np.ndarray) and cell_surface_area.ndim == 1:
+		if int(cell_surface_area.shape[0]) == cell_count and int(wet_indices.size) > 0:
+			wet_cell_area = np.asarray(cell_surface_area[wet_indices], dtype=np.float64)
+			wet_cell_area = wet_cell_area[np.isfinite(wet_cell_area) & (wet_cell_area > 0)]
+			if wet_cell_area.size > 0:
+				flood_area_square_meter = float(np.sum(wet_cell_area))
 	t_valid_filter = perf_counter()
 
 	if valid_count == 0:
@@ -1891,12 +1964,14 @@ def get_project_hdf_water_depth(
 				"cell_center_ref": cell_center_ref,
 				"bed_elevation_ref": bed_elevation_ref,
 				"water_surface_ref": water_surface_ref,
+				"cell_surface_area_ref": cell_surface_area_ref,
 				"face_point_coordinate_ref": face_point_coordinate_ref,
 				"face_point_indexes_ref": face_point_indexes_ref,
 				"face_velocity_ref": face_velocity_ref,
 				"include_dry": include_dry,
 				"min_depth": float(min_depth),
 			},
+			"flood_area_square_meter": 0.0,
 			"velocity_face_count": 0,
 			"velocity_faces": [],
 			"points": [],
@@ -1962,6 +2037,7 @@ def get_project_hdf_water_depth(
 		f"project_id={project_id} time_index={resolved_time_index} "
 		f"use_cache={int(use_cache)} "
 		f"valid={valid_count} sampled={len(points)} velocity_faces={len(velocity_faces)} stride={stride} "
+		f"flood_area={flood_area_square_meter:.2f}m2 "
 		f"total_ms={total_ms:.2f} cache_ms={cache_ms:.2f} "
 		f"water_read_ms={water_read_ms:.2f} velocity_read_ms={velocity_read_ms:.2f} "
 		f"filter_ms={filter_ms:.2f} sampling_ms={sampling_ms:.2f} "
@@ -1976,12 +2052,14 @@ def get_project_hdf_water_depth(
 		"time_step_count": time_step_count,
 		"point_count": len(points),
 		"velocity_face_count": len(velocity_faces),
+		"flood_area_square_meter": float(flood_area_square_meter),
 		"stride": stride,
 		"metadata": {
 			"source": str(project.hdf_path),
 			"cell_center_ref": cell_center_ref,
 			"bed_elevation_ref": bed_elevation_ref,
 			"water_surface_ref": water_surface_ref,
+			"cell_surface_area_ref": cell_surface_area_ref,
 			"face_point_coordinate_ref": face_point_coordinate_ref,
 			"face_point_indexes_ref": face_point_indexes_ref,
 			"face_velocity_ref": face_velocity_ref,
