@@ -64,6 +64,21 @@ class Project(Base):
         nullable=True,
         default=None,
     )
+    flow_hdf_path: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        default=None,
+    )
+    flow_hydrograph_ref: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        default=None,
+    )
+    flow_time_ref: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        default=None,
+    )
     bbox_minx: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     bbox_miny: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     bbox_maxx: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)

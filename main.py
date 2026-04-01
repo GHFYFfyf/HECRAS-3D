@@ -50,6 +50,13 @@ TIME_LABEL_REF = (
 	"Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/"
 	"Time Date Stamp"
 )
+FLOW_HYDROGRAPH_PREFIX = "Event Conditions/Unsteady/Boundary Conditions/Flow Hydrographs/"
+FLOW_HDF_SUFFIX_PRIORITY = (
+	".u01.hdf",
+	".g01.hdf",
+	".hdf",
+	".p01.hdf",
+)
 XN_XLSX_PATH = BASE_DIR / "xn.xlsx"
 _XN_XLSX_LOCK = Lock()
 _XN_XLSX_HEADERS = [
@@ -484,6 +491,151 @@ def _get_hdf_face_geometry_data(
 	return geometry_data
 
 
+def _ensure_projects_table_columns() -> None:
+	required_columns = {
+		"flow_hdf_path": "TEXT",
+		"flow_hydrograph_ref": "TEXT",
+		"flow_time_ref": "TEXT",
+	}
+	with engine.begin() as connection:
+		rows = connection.exec_driver_sql("PRAGMA table_info(projects)").fetchall()
+		existing_columns = {str(row[1]) for row in rows}
+		for column_name, column_type in required_columns.items():
+			if column_name in existing_columns:
+				continue
+			connection.exec_driver_sql(f"ALTER TABLE projects ADD COLUMN {column_name} {column_type}")
+
+
+def _split_hdf_base_name(file_name: str) -> str:
+	lower_name = file_name.lower()
+	for suffix in FLOW_HDF_SUFFIX_PRIORITY:
+		if lower_name.endswith(suffix):
+			return file_name[: len(file_name) - len(suffix)]
+	return Path(file_name).stem
+
+
+def _candidate_flow_hdf_paths(project_hdf_path: Path) -> list[Path]:
+	project_hdf_path = project_hdf_path.resolve()
+	base_name = _split_hdf_base_name(project_hdf_path.name)
+	candidates: list[Path] = []
+	for suffix in FLOW_HDF_SUFFIX_PRIORITY:
+		candidate = (project_hdf_path.parent / f"{base_name}{suffix}").resolve()
+		if not candidate.exists() or candidate in candidates:
+			continue
+		candidates.append(candidate)
+	if project_hdf_path.exists() and project_hdf_path not in candidates:
+		candidates.append(project_hdf_path)
+	return candidates
+
+
+def _discover_flow_hydrograph_ref(hdf_path: Path) -> tuple[str | None, str | None]:
+	flow_refs: list[str] = []
+	with h5py.File(hdf_path, "r") as hdf:
+		def _visitor(name: str, obj: Any) -> None:
+			if not isinstance(obj, h5py.Dataset):
+				return
+			if not name.startswith(FLOW_HYDROGRAPH_PREFIX):
+				return
+			if obj.ndim < 1 or int(obj.shape[0]) <= 0:
+				return
+			flow_refs.append(name)
+
+		hdf.visititems(_visitor)
+		if not flow_refs:
+			return None, None
+
+		flow_refs.sort()
+		preferred_ref = next(
+			(ref for ref in flow_refs if "bcline: st" in ref.lower()),
+			flow_refs[0],
+		)
+		time_ref = TIME_AXIS_REF if TIME_AXIS_REF in hdf else None
+		return preferred_ref, time_ref
+
+
+def _resolve_project_flow_source(project_hdf_path: Path) -> tuple[Path | None, str | None, str | None]:
+	for candidate_path in _candidate_flow_hdf_paths(project_hdf_path):
+		try:
+			flow_ref, time_ref = _discover_flow_hydrograph_ref(candidate_path)
+		except Exception:
+			continue
+		if flow_ref:
+			return candidate_path, flow_ref, time_ref
+	return None, None, None
+
+
+def _extract_flow_hydrograph_series(
+	*,
+	hdf_path: Path,
+	flow_hydrograph_ref: str,
+	flow_time_ref: str | None,
+) -> dict[str, Any]:
+	with h5py.File(hdf_path, "r") as hdf:
+		if flow_hydrograph_ref not in hdf:
+			raise HTTPException(status_code=400, detail=f"Missing HDF path: {flow_hydrograph_ref}")
+
+		hydrograph_raw = np.asarray(hdf[flow_hydrograph_ref][:], dtype=np.float64)
+		if hydrograph_raw.ndim == 1:
+			time_values = np.arange(hydrograph_raw.shape[0], dtype=np.float64)
+			flow_values = hydrograph_raw
+		elif hydrograph_raw.ndim >= 2:
+			flattened = hydrograph_raw.reshape(hydrograph_raw.shape[0], -1)
+			if flattened.shape[1] >= 2:
+				time_values = flattened[:, 0]
+				flow_values = flattened[:, 1]
+			else:
+				time_values = np.arange(flattened.shape[0], dtype=np.float64)
+				flow_values = flattened[:, 0]
+		else:
+			raise HTTPException(status_code=400, detail="Invalid flow hydrograph shape")
+
+		if flow_time_ref and flow_time_ref in hdf:
+			time_ds = np.asarray(hdf[flow_time_ref][:], dtype=np.float64)
+			if time_ds.ndim == 1 and time_ds.shape[0] == flow_values.shape[0]:
+				time_values = time_ds
+
+	finite_mask = np.isfinite(time_values) & np.isfinite(flow_values)
+	time_values = time_values[finite_mask]
+	flow_values = flow_values[finite_mask]
+	if flow_values.size == 0:
+		raise HTTPException(status_code=400, detail="Flow hydrograph dataset is empty after filtering")
+
+	peak_index = int(np.argmax(flow_values))
+	return {
+		"sample_count": int(flow_values.size),
+		"peak_flow": float(flow_values[peak_index]),
+		"peak_time": float(time_values[peak_index]),
+		"current_flow": float(flow_values[-1]),
+		"current_time": float(time_values[-1]),
+		"avg_flow": float(np.mean(flow_values)),
+		"series": [
+			[float(t), float(q)]
+			for t, q in zip(time_values, flow_values, strict=False)
+		],
+	}
+
+
+def _backfill_project_flow_metadata() -> None:
+	with Session(engine) as db:
+		projects = db.execute(select(Project)).scalars().all()
+		updated = False
+		for project in projects:
+			if project.flow_hdf_path and project.flow_hydrograph_ref:
+				continue
+			project_hdf_path = Path(project.hdf_path).resolve()
+			if not project_hdf_path.exists():
+				continue
+			source_hdf_path, flow_hydrograph_ref, flow_time_ref = _resolve_project_flow_source(project_hdf_path)
+			if not source_hdf_path or not flow_hydrograph_ref:
+				continue
+			project.flow_hdf_path = str(source_hdf_path)
+			project.flow_hydrograph_ref = flow_hydrograph_ref
+			project.flow_time_ref = flow_time_ref
+			updated = True
+		if updated:
+			db.commit()
+
+
 def _build_square_tile_bounds(
 	*,
 	width: int,
@@ -739,6 +891,8 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 @app.on_event("startup")
 def on_startup() -> None:
 	Base.metadata.create_all(bind=engine)
+	_ensure_projects_table_columns()
+	_backfill_project_flow_metadata()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -784,6 +938,7 @@ def get_project_cards(
 				"bbox_miny": project.bbox_miny,
 				"bbox_maxx": project.bbox_maxx,
 				"bbox_maxy": project.bbox_maxy,
+				"flow_ready": bool(project.flow_hdf_path and project.flow_hydrograph_ref),
 			}
 		)
 
@@ -873,6 +1028,7 @@ def create_project(
 	now = datetime.now(timezone.utc)
 	hdf_mtime = datetime.fromtimestamp(hdf_file.stat().st_mtime, timezone.utc)
 	tif_mtime = datetime.fromtimestamp(tif_file.stat().st_mtime, timezone.utc)
+	flow_hdf_path, flow_hydrograph_ref, flow_time_ref = _resolve_project_flow_source(hdf_file)
 
 	project = Project(
 		name=request.name,
@@ -888,6 +1044,9 @@ def create_project(
 		face_velocity_ref=FACE_VELOCITY_REF,
 		time_axis_ref=TIME_AXIS_REF,
 		time_label_ref=TIME_LABEL_REF,
+		flow_hdf_path=str(flow_hdf_path) if flow_hdf_path else None,
+		flow_hydrograph_ref=flow_hydrograph_ref,
+		flow_time_ref=flow_time_ref,
 		bbox_minx=bounds.left,
 		bbox_miny=bounds.bottom,
 		bbox_maxx=bounds.right,
@@ -909,6 +1068,68 @@ def create_project(
 		raise HTTPException(status_code=400, detail=f"数据库错误: {e}")
 
 	return {"ok": True, "project_id": project.id}
+
+
+@app.get("/api/projects/{project_id}/flow-hydrograph")
+def get_project_flow_hydrograph(
+	project_id: int,
+	db: Session = Depends(get_db),
+) -> dict[str, Any]:
+	project = db.get(Project, project_id)
+	if project is None:
+		raise HTTPException(status_code=404, detail="Project not found")
+
+	project_hdf_path = Path(project.hdf_path).resolve()
+	if not project_hdf_path.exists():
+		raise HTTPException(status_code=404, detail="Project HDF file not found")
+
+	source_hdf_path = Path(project.flow_hdf_path).resolve() if project.flow_hdf_path else None
+	flow_hydrograph_ref = project.flow_hydrograph_ref
+	flow_time_ref = project.flow_time_ref
+
+	need_refresh = (
+		source_hdf_path is None
+		or not source_hdf_path.exists()
+		or not flow_hydrograph_ref
+	)
+	if need_refresh:
+		source_hdf_path, flow_hydrograph_ref, flow_time_ref = _resolve_project_flow_source(project_hdf_path)
+		if not source_hdf_path or not flow_hydrograph_ref:
+			return {
+				"project_id": project_id,
+				"found": False,
+				"message": "未在 u01/g01/hdf/p01 中发现上游非恒定流边界曲线。",
+			}
+
+		project.flow_hdf_path = str(source_hdf_path)
+		project.flow_hydrograph_ref = flow_hydrograph_ref
+		project.flow_time_ref = flow_time_ref
+		db.add(project)
+		try:
+			db.commit()
+		except Exception:
+			db.rollback()
+
+	if source_hdf_path is None or flow_hydrograph_ref is None:
+		return {
+			"project_id": project_id,
+			"found": False,
+			"message": "流量曲线配置为空。",
+		}
+
+	series_payload = _extract_flow_hydrograph_series(
+		hdf_path=source_hdf_path,
+		flow_hydrograph_ref=flow_hydrograph_ref,
+		flow_time_ref=flow_time_ref,
+	)
+	return {
+		"project_id": project_id,
+		"found": True,
+		"source_hdf": str(source_hdf_path),
+		"flow_hydrograph_ref": flow_hydrograph_ref,
+		"flow_time_ref": flow_time_ref,
+		**series_payload,
+	}
 
 
 @app.get("/api/projects/{project_id}/tif-points")

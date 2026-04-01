@@ -7,7 +7,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Cesium.js"></script>
     <link href="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
-    <link rel="stylesheet" href="/assets/css/test.css">
+    <link rel="stylesheet" href="/assets/css/test.css?v=20260401a">
 </head>
 <body class="h-screen flex flex-col">
 
@@ -45,10 +45,6 @@
                     <a href="/stress-test" class="bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3 py-1.5 rounded flex items-center gap-1 transition-all">
                         散点压测
                     </a>
-                    <div class="relative">
-                        <input type="text" placeholder="查找..." class="bg-gray-800/50 border border-gray-700 rounded px-3 py-1.5 text-xs focus:outline-none focus:border-blue-500 w-32">
-                        <span class="absolute right-2 top-2 opacity-30 text-[10px]">🔍</span>
-                    </div>
                     <button id="btn-new-project" class="bg-blue-600 hover:bg-blue-500 text-white text-xs px-3 py-1.5 rounded flex items-center gap-1 transition-all">
                         新建项目
                     </button>
@@ -60,15 +56,20 @@
 
         <section class="w-[60%] flex flex-col overflow-hidden">
             
-            <div class="h-1/4 section-divider bg-[#0f1420]/30 p-4">
-                <div class="flex justify-between items-center mb-4">
-                    <span class="text-[10px] font-bold text-gray-500 uppercase tracking-widest">Hydraulic Statistics</span>
+            <div class="h-[36%] section-divider hydro-panel p-4">
+                <div class="flex justify-between items-center mb-3">
+                    <div>
+                        <span class="hydro-kicker">Hydro Intelligence</span>
+                        <h3 class="hydro-title">动态水动力总览</h3>
+                    </div>
                     <div class="flex gap-4 text-[10px] text-gray-400">
-                        <div class="flex items-center gap-1.5"><span class="w-2 h-2 bg-blue-500 rounded-full"></span><span>最终时刻</span></div>
-                        <div class="flex items-center gap-1.5"><span class="w-2 h-2 bg-sky-300 rounded-full"></span><span>深度分布</span></div>
+                        <div class="flex items-center gap-1.5"><span class="w-2 h-2 bg-cyan-400 rounded-full"></span><span>末时刻栅格</span></div>
+                        <div class="flex items-center gap-1.5"><span class="w-2 h-2 bg-emerald-400 rounded-full"></span><span>边界入流曲线</span></div>
+                        <div class="flex items-center gap-1.5"><span class="w-2 h-2 bg-indigo-300 rounded-full"></span><span>流速分布</span></div>
                     </div>
                 </div>
-                <div class="grid grid-cols-4 gap-2 mb-3 text-[10px]">
+
+                <div class="grid grid-cols-6 gap-2 mb-3 text-[10px] hydro-stats-grid">
                     <div class="stats-pill">
                         <span class="stats-pill__label">淹没点</span>
                         <strong id="statsPointCount" class="stats-pill__value">-</strong>
@@ -85,11 +86,33 @@
                         <span class="stats-pill__label">估算面积</span>
                         <strong id="statsFloodArea" class="stats-pill__value">-</strong>
                     </div>
+                    <div class="stats-pill">
+                        <span class="stats-pill__label">峰值入流</span>
+                        <strong id="statsFlowPeak" class="stats-pill__value">-</strong>
+                    </div>
+                    <div class="stats-pill">
+                        <span class="stats-pill__label">当前入流</span>
+                        <strong id="statsFlowCurrent" class="stats-pill__value">-</strong>
+                    </div>
                 </div>
-                <div id="hydraulicStatsChart" class="w-full h-[88px]"></div>
+
+                <div class="grid grid-cols-3 gap-3 h-[152px] min-h-0 hydro-charts-grid">
+                    <article class="chart-shell">
+                        <header class="chart-shell__title">水深分布</header>
+                        <div id="depthDistributionChart" class="chart-shell__body"></div>
+                    </article>
+                    <article class="chart-shell">
+                        <header class="chart-shell__title">上游非恒定流</header>
+                        <div id="flowHydrographChart" class="chart-shell__body"></div>
+                    </article>
+                    <article class="chart-shell">
+                        <header class="chart-shell__title">面流速分布</header>
+                        <div id="velocityHistogramChart" class="chart-shell__body"></div>
+                    </article>
+                </div>
             </div>
 
-            <div class="h-3/4 earth-container relative" id="cesiumContainer">
+            <div class="h-[64%] earth-container relative" id="cesiumContainer">
             </div>
 
         </section>
@@ -99,8 +122,8 @@
     <div id="deleteProjectModalRoot"></div>
 
 </body>
-<script src="/assets/js/project-cards.js"></script>
-<script src="/assets/js/new-project.js"></script>
+<script src="/assets/js/project-cards.js?v=20260401a"></script>
+<script src="/assets/js/new-project.js?v=20260401a"></script>
 <script src="/assets/vendor/echarts.min.js"></script>
-<script src="/assets/js/test.js"></script>
+<script src="/assets/js/test.js?v=20260401a"></script>
 </html>

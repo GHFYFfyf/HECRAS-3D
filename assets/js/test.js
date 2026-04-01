@@ -10,9 +10,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     const projectExtentEntities = new Map();
     let floodPointCollection = null;
     let activeProjectId = null;
-    let hydraulicChart = null;
+    let depthDistributionChart = null;
+    let flowHydrographChart = null;
+    let velocityHistogramChart = null;
+    let chartResizeBound = false;
     let latestStatsPayload = null;
     let latestGridSummary = null;
+    let latestFlowPayload = null;
     const mercatorProjection = new Cesium.WebMercatorProjection();
 
     // Grant CesiumJS access to your ion assets
@@ -57,20 +61,49 @@ document.addEventListener("DOMContentLoaded", async () => {
     // 设置背景透明
     viewer.scene.backgroundColor = Cesium.Color.TRANSPARENT;
 
-    function getHydraulicChart() {
-        const chartContainer = document.getElementById("hydraulicStatsChart");
-        if (!chartContainer || typeof echarts === "undefined") {
-            return null;
+    function ensureCharts() {
+        if (typeof echarts === "undefined") {
+            return {
+                depthChart: null,
+                flowChart: null,
+                velocityChart: null,
+            };
         }
-        if (!hydraulicChart) {
-            hydraulicChart = echarts.init(chartContainer, null, { renderer: "canvas" });
+
+        const depthContainer = document.getElementById("depthDistributionChart");
+        const flowContainer = document.getElementById("flowHydrographChart");
+        const velocityContainer = document.getElementById("velocityHistogramChart");
+
+        if (depthContainer && !depthDistributionChart) {
+            depthDistributionChart = echarts.init(depthContainer, null, { renderer: "canvas" });
+        }
+        if (flowContainer && !flowHydrographChart) {
+            flowHydrographChart = echarts.init(flowContainer, null, { renderer: "canvas" });
+        }
+        if (velocityContainer && !velocityHistogramChart) {
+            velocityHistogramChart = echarts.init(velocityContainer, null, { renderer: "canvas" });
+        }
+
+        if (!chartResizeBound) {
             window.addEventListener("resize", () => {
-                if (hydraulicChart) {
-                    hydraulicChart.resize();
+                if (depthDistributionChart) {
+                    depthDistributionChart.resize();
+                }
+                if (flowHydrographChart) {
+                    flowHydrographChart.resize();
+                }
+                if (velocityHistogramChart) {
+                    velocityHistogramChart.resize();
                 }
             });
+            chartResizeBound = true;
         }
-        return hydraulicChart;
+
+        return {
+            depthChart: depthDistributionChart,
+            flowChart: flowHydrographChart,
+            velocityChart: velocityHistogramChart,
+        };
     }
 
     function setStatsText(id, value) {
@@ -80,25 +113,126 @@ document.addEventListener("DOMContentLoaded", async () => {
         }
     }
 
-    function resetHydraulicStats() {
-        setStatsText("statsPointCount", "-");
-        setStatsText("statsAvgDepth", "-");
-        setStatsText("statsMaxDepth", "-");
-        setStatsText("statsFloodArea", "-");
+    function requestChartsResize() {
+        window.requestAnimationFrame(() => {
+            if (depthDistributionChart) {
+                depthDistributionChart.resize();
+            }
+            if (flowHydrographChart) {
+                flowHydrographChart.resize();
+            }
+            if (velocityHistogramChart) {
+                velocityHistogramChart.resize();
+            }
+        });
+    }
 
-        const chart = getHydraulicChart();
-        if (!chart) {
+    function updateDepthChart(depthBins) {
+        const { depthChart } = ensureCharts();
+        if (!depthChart) {
             return;
         }
 
-        chart.setOption({
-            animationDuration: 300,
-            grid: { left: 12, right: 6, top: 12, bottom: 18, containLabel: true },
+        depthChart.setOption({
+            animationDuration: 450,
+            tooltip: {
+                trigger: "axis",
+                axisPointer: { type: "shadow" },
+                backgroundColor: "rgba(5,16,30,0.92)",
+                borderColor: "rgba(103,187,255,0.4)",
+                textStyle: { color: "#d8ebff", fontSize: 10 }
+            },
+            grid: { left: 14, right: 8, top: 14, bottom: 18, containLabel: true },
             xAxis: {
                 type: "category",
-                data: ["0-0.5", "0.5-1", "1-2", "2-3", ">=3"],
+                data: depthBins.map((item) => item.name),
                 axisLine: { lineStyle: { color: "rgba(123,166,202,0.35)" } },
                 axisLabel: { color: "#7ba6ca", fontSize: 9 },
+                axisTick: { show: false }
+            },
+            yAxis: {
+                type: "value",
+                splitNumber: 3,
+                splitLine: { lineStyle: { color: "rgba(123,166,202,0.16)" } },
+                axisLine: { show: false },
+                axisTick: { show: false },
+                axisLabel: { color: "#6f93b1", fontSize: 9 }
+            },
+            visualMap: {
+                show: false,
+                min: 0,
+                max: Math.max(...depthBins.map((item) => item.count), 1),
+                dimension: 1,
+                inRange: {
+                    color: ["#14385f", "#1d6fbc", "#79c6ff"]
+                }
+            },
+            series: [{
+                type: "bar",
+                data: depthBins.map((item) => item.count),
+                barWidth: "58%",
+                itemStyle: {
+                    borderRadius: [4, 4, 0, 0]
+                },
+                emphasis: {
+                    itemStyle: {
+                        shadowBlur: 10,
+                        shadowColor: "rgba(95,183,255,0.45)"
+                    }
+                }
+            }]
+        });
+        requestChartsResize();
+    }
+
+    function buildVelocityBins(velocityFaces) {
+        const bins = [
+            { name: "0-0.5", min: 0.0, max: 0.5, count: 0 },
+            { name: "0.5-1", min: 0.5, max: 1.0, count: 0 },
+            { name: "1-2", min: 1.0, max: 2.0, count: 0 },
+            { name: "2-3", min: 2.0, max: 3.0, count: 0 },
+            { name: ">=3", min: 3.0, max: Number.POSITIVE_INFINITY, count: 0 },
+        ];
+
+        for (let i = 0; i < velocityFaces.length; i += 1) {
+            const velocity = Math.abs(Number(velocityFaces[i][2]));
+            if (!Number.isFinite(velocity)) {
+                continue;
+            }
+            for (let j = 0; j < bins.length; j += 1) {
+                const bin = bins[j];
+                if (velocity >= bin.min && velocity < bin.max) {
+                    bin.count += 1;
+                    break;
+                }
+            }
+        }
+
+        return bins;
+    }
+
+    function updateVelocityChart(velocityFaces) {
+        const { velocityChart } = ensureCharts();
+        if (!velocityChart) {
+            return;
+        }
+
+        const velocityBins = buildVelocityBins(velocityFaces);
+        velocityChart.setOption({
+            animationDuration: 450,
+            tooltip: {
+                trigger: "axis",
+                axisPointer: { type: "shadow" },
+                backgroundColor: "rgba(8,18,34,0.92)",
+                borderColor: "rgba(143,157,255,0.4)",
+                textStyle: { color: "#d8ebff", fontSize: 10 }
+            },
+            grid: { left: 14, right: 8, top: 14, bottom: 18, containLabel: true },
+            xAxis: {
+                type: "category",
+                data: velocityBins.map((item) => item.name),
+                axisLine: { lineStyle: { color: "rgba(131,152,255,0.35)" } },
+                axisLabel: { color: "#9db1ff", fontSize: 9 },
                 axisTick: { show: false }
             },
             yAxis: {
@@ -106,18 +240,148 @@ document.addEventListener("DOMContentLoaded", async () => {
                 splitLine: { lineStyle: { color: "rgba(123,166,202,0.16)" } },
                 axisLine: { show: false },
                 axisTick: { show: false },
-                axisLabel: { color: "#6f93b1", fontSize: 9 }
+                axisLabel: { color: "#7f95d7", fontSize: 9 }
             },
             series: [{
                 type: "bar",
-                data: [0, 0, 0, 0, 0],
-                barWidth: "55%",
+                data: velocityBins.map((item) => item.count),
+                barWidth: "58%",
                 itemStyle: {
-                    color: "rgba(77,159,255,0.35)",
-                    borderRadius: [4, 4, 0, 0]
+                    borderRadius: [4, 4, 0, 0],
+                    color: "rgba(121,132,255,0.55)",
                 }
             }]
         });
+        requestChartsResize();
+    }
+
+    function formatFlow(value) {
+        if (!Number.isFinite(value)) {
+            return "-";
+        }
+        const absValue = Math.abs(value);
+        if (absValue >= 1000) {
+            return `${value.toLocaleString("zh-CN", { maximumFractionDigits: 1 })} m3/s`;
+        }
+        return `${value.toLocaleString("zh-CN", { maximumFractionDigits: 2 })} m3/s`;
+    }
+
+    function updateFlowChart(flowPayload) {
+        latestFlowPayload = flowPayload;
+
+        const { flowChart } = ensureCharts();
+        if (!flowChart) {
+            return;
+        }
+
+        if (!flowPayload?.found || !Array.isArray(flowPayload.series) || flowPayload.series.length === 0) {
+            setStatsText("statsFlowPeak", "-");
+            setStatsText("statsFlowCurrent", "-");
+            flowChart.setOption({
+                animationDuration: 300,
+                grid: { left: 12, right: 8, top: 18, bottom: 18, containLabel: true },
+                xAxis: {
+                    type: "value",
+                    axisLine: { lineStyle: { color: "rgba(123,166,202,0.35)" } },
+                    axisLabel: { color: "#7ba6ca", fontSize: 9 },
+                    splitLine: { show: false },
+                },
+                yAxis: {
+                    type: "value",
+                    axisLine: { show: false },
+                    axisTick: { show: false },
+                    axisLabel: { color: "#6f93b1", fontSize: 9 },
+                    splitLine: { lineStyle: { color: "rgba(123,166,202,0.16)" } },
+                },
+                series: [{ type: "line", data: [] }],
+                graphic: {
+                    type: "text",
+                    left: "center",
+                    top: "middle",
+                    style: {
+                        text: "未检测到上游流量曲线",
+                        fill: "#7ba6ca",
+                        fontSize: 11,
+                    }
+                }
+            });
+            requestChartsResize();
+            return;
+        }
+
+        setStatsText("statsFlowPeak", formatFlow(Number(flowPayload.peak_flow)));
+        setStatsText("statsFlowCurrent", formatFlow(Number(flowPayload.current_flow)));
+
+        flowChart.setOption({
+            animationDuration: 450,
+            tooltip: {
+                trigger: "axis",
+                axisPointer: { type: "cross" },
+                backgroundColor: "rgba(8,18,34,0.92)",
+                borderColor: "rgba(100,219,178,0.45)",
+                textStyle: { color: "#d8ebff", fontSize: 10 },
+                valueFormatter: (value) => `${Number(value).toFixed(2)} m3/s`
+            },
+            grid: { left: 14, right: 8, top: 14, bottom: 18, containLabel: true },
+            xAxis: {
+                type: "value",
+                axisLine: { lineStyle: { color: "rgba(108,212,188,0.36)" } },
+                axisLabel: {
+                    color: "#81d7c4",
+                    fontSize: 9,
+                    formatter: (value) => Number(value).toFixed(2)
+                },
+                splitLine: { lineStyle: { color: "rgba(123,166,202,0.12)" } },
+            },
+            yAxis: {
+                type: "value",
+                axisLine: { show: false },
+                axisTick: { show: false },
+                axisLabel: { color: "#7ed8c2", fontSize: 9 },
+                splitLine: { lineStyle: { color: "rgba(123,166,202,0.16)" } },
+            },
+            series: [{
+                type: "line",
+                smooth: true,
+                showSymbol: false,
+                data: flowPayload.series,
+                lineStyle: {
+                    width: 2,
+                    color: "#3ad2aa",
+                },
+                areaStyle: {
+                    color: "rgba(58,210,170,0.2)",
+                },
+            }],
+            graphic: null,
+        });
+        requestChartsResize();
+    }
+
+    function resetDepthAndVelocityStats() {
+        setStatsText("statsPointCount", "-");
+        setStatsText("statsAvgDepth", "-");
+        setStatsText("statsMaxDepth", "-");
+        setStatsText("statsFloodArea", "-");
+        updateDepthChart([
+            { name: "0-0.5", count: 0 },
+            { name: "0.5-1", count: 0 },
+            { name: "1-2", count: 0 },
+            { name: "2-3", count: 0 },
+            { name: ">=3", count: 0 },
+        ]);
+        updateVelocityChart([]);
+    }
+
+    function resetFlowStats() {
+        setStatsText("statsFlowPeak", "-");
+        setStatsText("statsFlowCurrent", "-");
+        updateFlowChart({ found: false, series: [] });
+    }
+
+    function resetHydraulicStats() {
+        resetDepthAndVelocityStats();
+        resetFlowStats();
     }
 
     function formatArea(areaSquareMeter) {
@@ -183,62 +447,10 @@ document.addEventListener("DOMContentLoaded", async () => {
         setStatsText("statsAvgDepth", `${avgDepth.toFixed(2)} m`);
         setStatsText("statsMaxDepth", `${(Number.isFinite(maxDepth) ? maxDepth : 0).toFixed(2)} m`);
         setStatsText("statsFloodArea", formatArea(gridSummary?.floodArea ?? 0));
-
-        const chart = getHydraulicChart();
-        if (!chart) {
-            return;
-        }
-
         const depthBins = buildDepthBins(points);
-        chart.setOption({
-            animationDuration: 450,
-            tooltip: {
-                trigger: "axis",
-                axisPointer: { type: "shadow" },
-                backgroundColor: "rgba(5,16,30,0.92)",
-                borderColor: "rgba(103,187,255,0.4)",
-                textStyle: { color: "#d8ebff", fontSize: 10 }
-            },
-            grid: { left: 14, right: 8, top: 14, bottom: 18, containLabel: true },
-            xAxis: {
-                type: "category",
-                data: depthBins.map((item) => item.name),
-                axisLine: { lineStyle: { color: "rgba(123,166,202,0.35)" } },
-                axisLabel: { color: "#7ba6ca", fontSize: 9 },
-                axisTick: { show: false }
-            },
-            yAxis: {
-                type: "value",
-                splitNumber: 3,
-                splitLine: { lineStyle: { color: "rgba(123,166,202,0.16)" } },
-                axisLine: { show: false },
-                axisTick: { show: false },
-                axisLabel: { color: "#6f93b1", fontSize: 9 }
-            },
-            visualMap: {
-                show: false,
-                min: 0,
-                max: Math.max(...depthBins.map((item) => item.count), 1),
-                dimension: 1,
-                inRange: {
-                    color: ["#14385f", "#1d6fbc", "#79c6ff"]
-                }
-            },
-            series: [{
-                type: "bar",
-                data: depthBins.map((item) => item.count),
-                barWidth: "58%",
-                itemStyle: {
-                    borderRadius: [4, 4, 0, 0]
-                },
-                emphasis: {
-                    itemStyle: {
-                        shadowBlur: 10,
-                        shadowColor: "rgba(95,183,255,0.45)"
-                    }
-                }
-            }]
-        });
+        const velocityFaces = Array.isArray(payload?.velocity_faces) ? payload.velocity_faces : [];
+        updateDepthChart(depthBins);
+        updateVelocityChart(velocityFaces);
     }
 
     try {
@@ -374,6 +586,19 @@ document.addEventListener("DOMContentLoaded", async () => {
         return response.json();
     }
 
+    async function fetchFlowHydrographPayload(projectId) {
+        const response = await fetch(
+            `/api/projects/${encodeURIComponent(projectId)}/flow-hydrograph`,
+            { headers: { Accept: "application/json" } }
+        );
+
+        if (!response.ok) {
+            throw new Error(`Failed to load flow hydrograph payload: ${response.status}`);
+        }
+
+        return response.json();
+    }
+
     async function renderProjectFloodAndStats(project) {
         if (!project?.id) {
             clearFloodGridOverlay();
@@ -381,14 +606,26 @@ document.addEventListener("DOMContentLoaded", async () => {
             return;
         }
 
-        try {
-            const payload = await fetchFinalDepthPayload(project.id);
+        const [depthResult, flowResult] = await Promise.allSettled([
+            fetchFinalDepthPayload(project.id),
+            fetchFlowHydrographPayload(project.id),
+        ]);
+
+        if (depthResult.status === "fulfilled") {
+            const payload = depthResult.value;
             const gridSummary = renderFloodGridOverlay(payload?.points || []);
             updateHydraulicStatsFromPayload(payload, gridSummary);
-        } catch (error) {
-            console.error("Failed to render flood overlay:", error);
+        } else {
+            console.error("Failed to render flood overlay:", depthResult.reason);
             clearFloodGridOverlay();
-            resetHydraulicStats();
+            resetDepthAndVelocityStats();
+        }
+
+        if (flowResult.status === "fulfilled") {
+            updateFlowChart(flowResult.value);
+        } else {
+            console.error("Failed to render flow hydrograph:", flowResult.reason);
+            resetFlowStats();
         }
     }
 
@@ -535,7 +772,13 @@ document.addEventListener("DOMContentLoaded", async () => {
         if (latestStatsPayload) {
             updateHydraulicStatsFromPayload(latestStatsPayload, latestGridSummary || { floodArea: 0 });
         } else {
-            resetHydraulicStats();
+            resetDepthAndVelocityStats();
+        }
+
+        if (latestFlowPayload) {
+            updateFlowChart(latestFlowPayload);
+        } else {
+            resetFlowStats();
         }
     });
 
