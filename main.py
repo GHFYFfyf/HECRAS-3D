@@ -31,6 +31,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 _HDF_STATIC_CACHE_LOCK = Lock()
 _HDF_STATIC_CACHE: dict[tuple[str, int, str, str, str], dict[str, Any]] = {}
+_HDF_FACE_GEOMETRY_CACHE: dict[tuple[str, int, str, str], dict[str, Any]] = {}
 
 CELL_CENTER_REF = "Geometry/2D Flow Areas/Perimeter 1/Cells Center Coordinate"
 BED_ELEVATION_REF = "Geometry/2D Flow Areas/Perimeter 1/Cells Minimum Elevation"
@@ -402,6 +403,85 @@ def _get_hdf_static_data(
 			_HDF_STATIC_CACHE.pop(stale_key, None)
 		_HDF_STATIC_CACHE[cache_key] = static_data
 	return static_data
+
+
+def _get_hdf_face_geometry_data(
+	hdf_path: Path,
+	face_point_coordinate_ref: str,
+	face_point_indexes_ref: str,
+	use_cache: bool = True,
+) -> dict[str, Any]:
+	cache_key = None
+	if use_cache:
+		hdf_stat = hdf_path.stat()
+		cache_key = (
+			str(hdf_path),
+			int(hdf_stat.st_mtime_ns),
+			face_point_coordinate_ref,
+			face_point_indexes_ref,
+		)
+		with _HDF_STATIC_CACHE_LOCK:
+			cached = _HDF_FACE_GEOMETRY_CACHE.get(cache_key)
+		if cached is not None:
+			return cached
+
+	with h5py.File(hdf_path, "r") as hdf:
+		if face_point_coordinate_ref not in hdf:
+			raise HTTPException(status_code=400, detail=f"Missing HDF path: {face_point_coordinate_ref}")
+		if face_point_indexes_ref not in hdf:
+			raise HTTPException(status_code=400, detail=f"Missing HDF path: {face_point_indexes_ref}")
+
+		face_point_coords = np.asarray(hdf[face_point_coordinate_ref][:], dtype=np.float32)
+		face_point_indexes = np.asarray(hdf[face_point_indexes_ref][:], dtype=np.int64)
+
+		if face_point_coords.ndim != 2 or face_point_coords.shape[1] < 2:
+			raise HTTPException(status_code=400, detail="Invalid face-point coordinates shape")
+		if face_point_indexes.ndim != 2:
+			raise HTTPException(status_code=400, detail="Invalid face-point index shape")
+
+		face_point_count = int(face_point_coords.shape[0])
+		face_count = int(face_point_indexes.shape[0])
+
+		if face_count == 0:
+			face_centers_xy = np.empty((0, 2), dtype=np.float32)
+			face_has_valid_center = np.empty(0, dtype=bool)
+		else:
+			valid_vertex_mask = (face_point_indexes >= 0) & (face_point_indexes < face_point_count)
+			safe_indexes = np.where(valid_vertex_mask, face_point_indexes, 0)
+			vertex_count = valid_vertex_mask.sum(axis=1).astype(np.float32)
+			has_valid_center = vertex_count > 0
+
+			selected_x = face_point_coords[safe_indexes, 0]
+			selected_y = face_point_coords[safe_indexes, 1]
+			selected_x = np.where(valid_vertex_mask, selected_x, 0.0)
+			selected_y = np.where(valid_vertex_mask, selected_y, 0.0)
+
+			face_center_x = np.full(face_count, np.nan, dtype=np.float32)
+			face_center_y = np.full(face_count, np.nan, dtype=np.float32)
+			np.divide(selected_x.sum(axis=1), vertex_count, out=face_center_x, where=has_valid_center)
+			np.divide(selected_y.sum(axis=1), vertex_count, out=face_center_y, where=has_valid_center)
+
+			face_centers_xy = np.column_stack((face_center_x, face_center_y)).astype(np.float32, copy=False)
+			face_has_valid_center = has_valid_center
+
+		geometry_data = {
+			"face_centers_xy": face_centers_xy,
+			"face_has_valid_center": face_has_valid_center,
+			"face_count": face_count,
+		}
+
+	if not use_cache:
+		return geometry_data
+
+	with _HDF_STATIC_CACHE_LOCK:
+		cached = _HDF_FACE_GEOMETRY_CACHE.get(cache_key)
+		if cached is not None:
+			return cached
+		stale_keys = [key for key in _HDF_FACE_GEOMETRY_CACHE if key[0] == str(hdf_path) and key != cache_key]
+		for stale_key in stale_keys:
+			_HDF_FACE_GEOMETRY_CACHE.pop(stale_key, None)
+		_HDF_FACE_GEOMETRY_CACHE[cache_key] = geometry_data
+	return geometry_data
 
 
 def _build_square_tile_bounds(
@@ -1478,6 +1558,9 @@ def get_project_hdf_water_depth(
 		"Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/"
 		"2D Flow Areas/Perimeter 1/Water Surface"
 	)
+	face_point_coordinate_ref = project.face_point_coordinate_ref or FACE_POINT_COORDINATE_REF
+	face_point_indexes_ref = project.face_point_indexes_ref or FACE_POINT_INDEXES_REF
+	face_velocity_ref = project.face_velocity_ref or FACE_VELOCITY_REF
 
 	static_data = _get_hdf_static_data(
 		hdf_path=hdf_path,
@@ -1486,11 +1569,20 @@ def get_project_hdf_water_depth(
 		water_surface_ref=water_surface_ref,
 		use_cache=use_cache,
 	)
+	face_geometry_data = _get_hdf_face_geometry_data(
+		hdf_path=hdf_path,
+		face_point_coordinate_ref=face_point_coordinate_ref,
+		face_point_indexes_ref=face_point_indexes_ref,
+		use_cache=use_cache,
+	)
 	t_cache_ready = perf_counter()
 	coords = static_data["coords"]
 	bed = static_data["bed"]
 	cell_count = int(static_data["cell_count"])
 	time_step_count = int(static_data["time_step_count"])
+	face_centers_xy = face_geometry_data["face_centers_xy"]
+	face_has_valid_center = face_geometry_data["face_has_valid_center"]
+	face_count = int(face_geometry_data["face_count"])
 
 	if time_step_count == 0 or cell_count == 0:
 		# Send: empty timeline frame payload to frontend when no timestep or no cell exists.
@@ -1505,7 +1597,12 @@ def get_project_hdf_water_depth(
 				"cell_center_ref": cell_center_ref,
 				"bed_elevation_ref": bed_elevation_ref,
 				"water_surface_ref": water_surface_ref,
+				"face_point_coordinate_ref": face_point_coordinate_ref,
+				"face_point_indexes_ref": face_point_indexes_ref,
+				"face_velocity_ref": face_velocity_ref,
 			},
+			"velocity_face_count": 0,
+			"velocity_faces": [],
 			"points": [],
 		}
 
@@ -1519,11 +1616,28 @@ def get_project_hdf_water_depth(
 	with h5py.File(hdf_path, "r") as hdf:
 		if water_surface_ref not in hdf:
 			raise HTTPException(status_code=400, detail=f"Missing HDF path: {water_surface_ref}")
+		if face_velocity_ref not in hdf:
+			raise HTTPException(status_code=400, detail=f"Missing HDF path: {face_velocity_ref}")
 		water_surface_ds = hdf[water_surface_ref]
+		face_velocity_ds = hdf[face_velocity_ref]
 		if water_surface_ds.ndim != 2 or int(water_surface_ds.shape[1]) != cell_count:
 			raise HTTPException(status_code=400, detail="Inconsistent HDF dataset sizes")
+		if face_velocity_ds.ndim != 2:
+			raise HTTPException(status_code=400, detail="Invalid face velocity shape")
+		if int(face_velocity_ds.shape[1]) != face_count:
+			raise HTTPException(status_code=400, detail="Inconsistent face velocity dataset sizes")
+		if resolved_time_index < 0 or resolved_time_index >= int(face_velocity_ds.shape[0]):
+			raise HTTPException(
+				status_code=400,
+				detail=(
+					f"face velocity time_index out of range: {resolved_time_index}, "
+					f"valid [0, {int(face_velocity_ds.shape[0]) - 1}]"
+				),
+			)
 		water_surface = np.asarray(water_surface_ds[resolved_time_index, :], dtype=np.float32)
-	t_water_surface_read = perf_counter()
+		t_water_surface_read = perf_counter()
+		face_velocity = np.asarray(face_velocity_ds[resolved_time_index, :], dtype=np.float32)
+	t_face_velocity_read = perf_counter()
 
 	depth = water_surface - bed
 
@@ -1556,9 +1670,14 @@ def get_project_hdf_water_depth(
 				"cell_center_ref": cell_center_ref,
 				"bed_elevation_ref": bed_elevation_ref,
 				"water_surface_ref": water_surface_ref,
+				"face_point_coordinate_ref": face_point_coordinate_ref,
+				"face_point_indexes_ref": face_point_indexes_ref,
+				"face_velocity_ref": face_velocity_ref,
 				"include_dry": include_dry,
 				"min_depth": float(min_depth),
 			},
+			"velocity_face_count": 0,
+			"velocity_faces": [],
 			"points": [],
 		}
 
@@ -1592,35 +1711,59 @@ def get_project_hdf_water_depth(
 	]
 	t_points_build = perf_counter()
 
-	total_ms = (t_points_build - request_start) * 1000.0
+	velocity_valid_mask = (
+		face_has_valid_center
+		& np.isfinite(face_centers_xy[:, 0])
+		& np.isfinite(face_centers_xy[:, 1])
+		& np.isfinite(face_velocity)
+	)
+	velocity_indices = np.flatnonzero(velocity_valid_mask)
+	velocity_faces = [
+		[
+			float(face_centers_xy[idx, 0]),
+			float(face_centers_xy[idx, 1]),
+			float(face_velocity[idx]),
+		]
+		for idx in velocity_indices
+	]
+	t_velocity_faces_build = perf_counter()
+
+	total_ms = (t_velocity_faces_build - request_start) * 1000.0
 	cache_ms = (t_cache_ready - request_start) * 1000.0
 	water_read_ms = (t_water_surface_read - t_cache_ready) * 1000.0
-	filter_ms = (t_valid_filter - t_water_surface_read) * 1000.0
+	velocity_read_ms = (t_face_velocity_read - t_water_surface_read) * 1000.0
+	filter_ms = (t_valid_filter - t_face_velocity_read) * 1000.0
 	sampling_ms = (t_sampling - t_valid_filter) * 1000.0
 	points_ms = (t_points_build - t_sampling) * 1000.0
+	velocity_faces_ms = (t_velocity_faces_build - t_points_build) * 1000.0
 	print(
 		"[perf][hdf-water-depth] "
 		f"project_id={project_id} time_index={resolved_time_index} "
 		f"use_cache={int(use_cache)} "
-		f"valid={valid_count} sampled={len(points)} stride={stride} "
+		f"valid={valid_count} sampled={len(points)} velocity_faces={len(velocity_faces)} stride={stride} "
 		f"total_ms={total_ms:.2f} cache_ms={cache_ms:.2f} "
-		f"water_read_ms={water_read_ms:.2f} filter_ms={filter_ms:.2f} "
-		f"sampling_ms={sampling_ms:.2f} points_ms={points_ms:.2f}"
+		f"water_read_ms={water_read_ms:.2f} velocity_read_ms={velocity_read_ms:.2f} "
+		f"filter_ms={filter_ms:.2f} sampling_ms={sampling_ms:.2f} "
+		f"points_ms={points_ms:.2f} velocity_faces_ms={velocity_faces_ms:.2f}"
 	)
 
-	# Send: sampled [x, y, bed_z, water_z, depth] points and timeline metadata
-	# to frontend assets/js/three-hdf-overlay.js for visualization and slider state.
+	# Send: sampled [x, y, bed_z, water_z, depth] points and face-centered
+	# [x, y, velocity] arrays to frontend assets/js/three-hdf-overlay.js.
 	result = {
 		"project_id": project_id,
 		"time_index": resolved_time_index,
 		"time_step_count": time_step_count,
 		"point_count": len(points),
+		"velocity_face_count": len(velocity_faces),
 		"stride": stride,
 		"metadata": {
 			"source": str(project.hdf_path),
 			"cell_center_ref": cell_center_ref,
 			"bed_elevation_ref": bed_elevation_ref,
 			"water_surface_ref": water_surface_ref,
+			"face_point_coordinate_ref": face_point_coordinate_ref,
+			"face_point_indexes_ref": face_point_indexes_ref,
+			"face_velocity_ref": face_velocity_ref,
 			"include_dry": include_dry,
 			"min_depth": float(min_depth),
 		},
@@ -1628,16 +1771,21 @@ def get_project_hdf_water_depth(
 			"total_ms": float(total_ms),
 			"cache_ms": float(cache_ms),
 			"water_read_ms": float(water_read_ms),
+			"velocity_read_ms": float(velocity_read_ms),
 			"filter_ms": float(filter_ms),
 			"sampling_ms": float(sampling_ms),
 			"points_ms": float(points_ms),
+			"velocity_faces_ms": float(velocity_faces_ms),
 		},
+		"velocity_faces": velocity_faces,
 		"points": points,
 	}
 	if response is not None:
 		response.headers["Server-Timing"] = (
 			f"total;dur={total_ms:.2f},gen;dur={total_ms:.2f},cache;dur={cache_ms:.2f},"
-			f"water;dur={water_read_ms:.2f},filter;dur={filter_ms:.2f},sampling;dur={sampling_ms:.2f},points;dur={points_ms:.2f}"
+			f"water;dur={water_read_ms:.2f},velocity;dur={velocity_read_ms:.2f},"
+			f"filter;dur={filter_ms:.2f},sampling;dur={sampling_ms:.2f},"
+			f"points;dur={points_ms:.2f},velocity_faces;dur={velocity_faces_ms:.2f}"
 		)
 	return result
 

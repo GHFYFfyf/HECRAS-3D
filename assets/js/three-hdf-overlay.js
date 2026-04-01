@@ -19,9 +19,12 @@
     const HDF_INITIAL_TIME_INDEX = 0;
     const HDF_INCLUDE_DRY_DEFAULT = false;
     const HDF_MIN_DEPTH_DEFAULT = 0.05;
-    const HDF_PLAY_INTERVAL_MS_DEFAULT = 80;
+    const HDF_PLAY_INTERVAL_MS_DEFAULT = 48;
     const HDF_PLAY_INTERVAL_MS_MIN = 16;
     const HDF_PLAY_INTERVAL_MS_MAX = 1000;
+    const HDF_PAYLOAD_CACHE_LIMIT = 20;
+    const HDF_PREFETCH_AHEAD_COUNT = 2;
+    const HDF_VERBOSE_FRAME_LOG = false;
     const HDF_LOAD_ENABLED = true;
     const AUTO_WRITE_WHEN_DRAWCALLS_EQ = 1;
     const AUTO_WRITE_COOLDOWN_MS = 12000;
@@ -121,6 +124,68 @@
      * Flow: bootstrap/runtime -> DataModule -> backend JSON -> overlay pipeline.
      */
     const DataModule = {
+        state: {
+            payloadCache: new Map(),
+            payloadCacheOrder: [],
+            inFlightRequests: new Map(),
+        },
+
+        buildPayloadCacheKey(projectId, timeIndex) {
+            return `${String(projectId)}|cache:${RuntimeState.cacheMode}|t:${Math.trunc(timeIndex)}`;
+        },
+
+        getCachedPayload(cacheKey) {
+            if (!cacheKey) {
+                return null;
+            }
+            return this.state.payloadCache.get(cacheKey) || null;
+        },
+
+        cachePayload(cacheKey, payload) {
+            if (!cacheKey || !payload) {
+                return;
+            }
+            if (this.state.payloadCache.has(cacheKey)) {
+                const existedIndex = this.state.payloadCacheOrder.indexOf(cacheKey);
+                if (existedIndex >= 0) {
+                    this.state.payloadCacheOrder.splice(existedIndex, 1);
+                }
+            }
+            this.state.payloadCache.set(cacheKey, payload);
+            this.state.payloadCacheOrder.push(cacheKey);
+
+            while (this.state.payloadCacheOrder.length > HDF_PAYLOAD_CACHE_LIMIT) {
+                const oldestKey = this.state.payloadCacheOrder.shift();
+                if (!oldestKey) {
+                    continue;
+                }
+                this.state.payloadCache.delete(oldestKey);
+            }
+        },
+
+        clearPayloadCache() {
+            this.state.payloadCache.clear();
+            this.state.payloadCacheOrder = [];
+            this.state.inFlightRequests.clear();
+        },
+
+        prefetchWaterDepthPayload(projectId, timeIndex) {
+            if (RuntimeState.cacheMode === "cold") {
+                return;
+            }
+            const safeTimeIndex = Number.isInteger(timeIndex) ? timeIndex : Number.NaN;
+            if (!Number.isFinite(safeTimeIndex) || safeTimeIndex < 0) {
+                return;
+            }
+
+            void this.fetchWaterDepthPayload(projectId, safeTimeIndex, {
+                isPrefetch: true,
+                allowUiPerfWrite: false,
+            }).catch((error) => {
+                void error;
+            });
+        },
+
         /**
          * resolveProjectIdFromUrl
          * Function: Read `project_id` from URL query string.
@@ -241,13 +306,32 @@
          * Input: projectId (string), timeIndex (integer, -1 for backend default).
          * Output: Promise<{points, time_index, time_step_count, ...}>.
          */
-        async fetchWaterDepthPayload(projectId, timeIndex) {
+        async fetchWaterDepthPayload(projectId, timeIndex, options = {}) {
             const safeTimeIndex = Number.isInteger(timeIndex) ? timeIndex : HDF_INITIAL_TIME_INDEX;
-            console.log("[hdf-water-depth] request time_index", safeTimeIndex);
+            const useBackendCache = RuntimeState.cacheMode !== "cold";
+            const allowUiPerfWrite = options.allowUiPerfWrite !== false;
+            const useLocalCache = safeTimeIndex >= 0 && useBackendCache;
+            const cacheKey = useLocalCache ? this.buildPayloadCacheKey(projectId, safeTimeIndex) : null;
+
+            if (useLocalCache) {
+                const cachedPayload = this.getCachedPayload(cacheKey);
+                if (cachedPayload) {
+                    return cachedPayload;
+                }
+                const inFlight = this.state.inFlightRequests.get(cacheKey);
+                if (inFlight) {
+                    return inFlight;
+                }
+            }
+
+            if (!options.isPrefetch) {
+                console.log("[hdf-water-depth] request time_index", safeTimeIndex);
+            }
+
+            const requestPromise = (async () => {
             const fetchStartAt = performance.now();
-            const useCache = RuntimeState.cacheMode !== "cold";
             const response = await fetch(
-                `/api/projects/${encodeURIComponent(projectId)}/hdf-water-depth?time_index=${encodeURIComponent(safeTimeIndex)}&max_points=${MAX_POINTS_QUERY}&include_dry=${HDF_INCLUDE_DRY_DEFAULT ? "true" : "false"}&min_depth=${encodeURIComponent(HDF_MIN_DEPTH_DEFAULT)}&use_cache=${useCache ? "true" : "false"}`,
+                `/api/projects/${encodeURIComponent(projectId)}/hdf-water-depth?time_index=${encodeURIComponent(safeTimeIndex)}&max_points=${MAX_POINTS_QUERY}&include_dry=${HDF_INCLUDE_DRY_DEFAULT ? "true" : "false"}&min_depth=${encodeURIComponent(HDF_MIN_DEPTH_DEFAULT)}&use_cache=${useBackendCache ? "true" : "false"}`,
                 { headers: { Accept: "application/json" } },
             );
             if (!response.ok) {
@@ -262,13 +346,32 @@
             const parseMs = parseEndAt - parseStartAt;
             const backendTransferMs = Math.max(0, fetchMs - serverTiming.total);
 
-            setPerfText(perfDom.dataGen, formatMs(serverTiming.gen));
-            setPerfText(perfDom.backendTransfer, formatMs(backendTransferMs));
-            setPerfText(perfDom.frontendFetch, formatMs(fetchMs));
-            setPerfText(perfDom.frontendParse, formatMs(parseMs));
-            setPerfText(perfDom.stage, `HDF ${RuntimeState.cacheMode} fetch/parse`);
+            if (allowUiPerfWrite) {
+                setPerfText(perfDom.dataGen, formatMs(serverTiming.gen));
+                setPerfText(perfDom.backendTransfer, formatMs(backendTransferMs));
+                setPerfText(perfDom.frontendFetch, formatMs(fetchMs));
+                setPerfText(perfDom.frontendParse, formatMs(parseMs));
+                setPerfText(perfDom.stage, `HDF ${RuntimeState.cacheMode} fetch/parse`);
+            }
+
+            if (useLocalCache) {
+                this.cachePayload(cacheKey, payload);
+            }
 
             return payload;
+            })();
+
+            if (useLocalCache) {
+                this.state.inFlightRequests.set(cacheKey, requestPromise);
+            }
+
+            try {
+                return await requestPromise;
+            } finally {
+                if (useLocalCache) {
+                    this.state.inFlightRequests.delete(cacheKey);
+                }
+            }
         },
 
         /**
@@ -281,7 +384,9 @@
             console.log("[hdf-water-depth] points", {
                 time_index: payload.time_index,
                 point_count: payload.point_count,
+                velocity_face_count: payload.velocity_face_count,
                 points_sample: Array.isArray(payload.points) ? payload.points.slice(0, 10) : [],
+                velocity_faces_sample: Array.isArray(payload.velocity_faces) ? payload.velocity_faces.slice(0, 5) : [],
             });
         },
     };
@@ -546,6 +651,320 @@
                     ? "water_z < bed_z exists in source points; check HDF refs/units."
                     : "source points are physically consistent; buried look is likely terrain baseline or smoothing effect.",
             });
+        },
+    };
+
+    /**
+     * InteractionModule
+     * Function: Raycast clicked overlay region and show depth + estimated velocity.
+     * Velocity estimation rule: average of around four nearest directional face velocities.
+     */
+    const InteractionModule = {
+        state: {
+            raycaster: new THREE.Raycaster(),
+            pointerNdc: new THREE.Vector2(),
+            isBound: false,
+            dom: null,
+        },
+
+        formatNumber(value, digits = 3, suffix = "") {
+            if (!Number.isFinite(value)) {
+                return "--";
+            }
+            return `${value.toFixed(digits)}${suffix}`;
+        },
+
+        ensurePanel() {
+            if (this.state.dom) {
+                return this.state.dom;
+            }
+
+            let root = document.getElementById("hdfPickInfoRoot");
+            if (!root) {
+                root = document.createElement("aside");
+                root.id = "hdfPickInfoRoot";
+                root.style.position = "fixed";
+                root.style.left = "0px";
+                root.style.top = "0px";
+                root.style.minWidth = "220px";
+                root.style.maxWidth = "min(320px, calc(100vw - 16px))";
+                root.style.padding = "10px 12px";
+                root.style.borderRadius = "12px";
+                root.style.border = "1px solid rgba(255, 255, 255, 0.22)";
+                root.style.background = "rgba(7, 10, 18, 0.88)";
+                root.style.color = "#dbe5ff";
+                root.style.font = "12px/1.5 Menlo, Consolas, monospace";
+                root.style.letterSpacing = "0.2px";
+                root.style.zIndex = "26";
+                root.style.pointerEvents = "none";
+                root.style.display = "none";
+
+                root.innerHTML = [
+                    "<div style=\"display:flex;justify-content:space-between;gap:8px;\"><span style=\"color:#9fb3e4;\">xy</span><strong id=\"hdfPickXY\">--</strong></div>",
+                    "<div style=\"display:flex;justify-content:space-between;gap:8px;\"><span style=\"color:#9fb3e4;\">水深</span><strong id=\"hdfPickDepth\">--</strong></div>",
+                    "<div style=\"display:flex;justify-content:space-between;gap:8px;\"><span style=\"color:#9fb3e4;\">流速</span><strong id=\"hdfPickVelocity\">--</strong></div>",
+                ].join("");
+
+                document.body.appendChild(root);
+            }
+
+            const dom = {
+                root,
+                xy: document.getElementById("hdfPickXY"),
+                depth: document.getElementById("hdfPickDepth"),
+                velocity: document.getElementById("hdfPickVelocity"),
+            };
+            this.state.dom = dom;
+            return dom;
+        },
+
+        setPanelText(field, text) {
+            const dom = this.ensurePanel();
+            const node = dom && dom[field] ? dom[field] : null;
+            if (node) {
+                node.textContent = text;
+            }
+        },
+
+        showPanelAt(clientX, clientY) {
+            const dom = this.ensurePanel();
+            if (!dom || !dom.root) {
+                return;
+            }
+            const root = dom.root;
+            const offset = 14;
+            const margin = 8;
+
+            root.style.visibility = "hidden";
+            root.style.display = "block";
+            root.style.left = "0px";
+            root.style.top = "0px";
+
+            const rect = root.getBoundingClientRect();
+            let left = clientX + offset;
+            let top = clientY + offset;
+
+            if (left + rect.width + margin > window.innerWidth) {
+                left = Math.max(margin, clientX - rect.width - offset);
+            }
+            if (top + rect.height + margin > window.innerHeight) {
+                top = Math.max(margin, clientY - rect.height - offset);
+            }
+
+            root.style.left = `${left}px`;
+            root.style.top = `${top}px`;
+            root.style.visibility = "visible";
+        },
+
+        hidePanel() {
+            const dom = this.ensurePanel();
+            if (dom && dom.root) {
+                dom.root.style.display = "none";
+            }
+        },
+
+        findNearestDepthPoint(points, x, y) {
+            const source = Array.isArray(points) ? points : [];
+            let bestPoint = null;
+            let bestDist2 = Number.POSITIVE_INFINITY;
+
+            for (let i = 0; i < source.length; i += 1) {
+                const point = source[i];
+                const px = Number(point && point[0]);
+                const py = Number(point && point[1]);
+                if (!Number.isFinite(px) || !Number.isFinite(py)) {
+                    continue;
+                }
+
+                const dx = px - x;
+                const dy = py - y;
+                const dist2 = dx * dx + dy * dy;
+                if (dist2 < bestDist2) {
+                    bestDist2 = dist2;
+                    bestPoint = point;
+                }
+            }
+
+            if (!bestPoint || !Number.isFinite(bestDist2)) {
+                return null;
+            }
+            return {
+                point: bestPoint,
+                distanceM: Math.sqrt(bestDist2),
+            };
+        },
+
+        selectDirectionalVelocityFaces(velocityFaces, x, y, targetCount = 4) {
+            const faces = Array.isArray(velocityFaces) ? velocityFaces : [];
+            if (!faces.length) {
+                return [];
+            }
+
+            const directional = {
+                posX: null,
+                negX: null,
+                posY: null,
+                negY: null,
+            };
+            const nearest = [];
+
+            const pushDirectional = (key, sample) => {
+                if (!sample) {
+                    return;
+                }
+                if (!directional[key] || sample.dist2 < directional[key].dist2) {
+                    directional[key] = sample;
+                }
+            };
+
+            for (let i = 0; i < faces.length; i += 1) {
+                const face = faces[i];
+                const fx = Number(face && face[0]);
+                const fy = Number(face && face[1]);
+                const velocity = Number(face && face[2]);
+                if (!Number.isFinite(fx) || !Number.isFinite(fy) || !Number.isFinite(velocity)) {
+                    continue;
+                }
+
+                const dx = fx - x;
+                const dy = fy - y;
+                const dist2 = dx * dx + dy * dy;
+                const sample = { index: i, velocity, dist2 };
+                nearest.push(sample);
+
+                if (dx >= 0) {
+                    pushDirectional("posX", sample);
+                } else {
+                    pushDirectional("negX", sample);
+                }
+
+                if (dy >= 0) {
+                    pushDirectional("posY", sample);
+                } else {
+                    pushDirectional("negY", sample);
+                }
+            }
+
+            nearest.sort((a, b) => a.dist2 - b.dist2);
+            const selected = [];
+            const used = new Set();
+            const pushUnique = (sample) => {
+                if (!sample || used.has(sample.index)) {
+                    return;
+                }
+                used.add(sample.index);
+                selected.push(sample);
+            };
+
+            pushUnique(directional.posX);
+            pushUnique(directional.negX);
+            pushUnique(directional.posY);
+            pushUnique(directional.negY);
+
+            for (let i = 0; i < nearest.length && selected.length < targetCount; i += 1) {
+                pushUnique(nearest[i]);
+            }
+
+            return selected.slice(0, targetCount);
+        },
+
+        estimateVelocityByFaces(velocityFaces, x, y) {
+            const samples = this.selectDirectionalVelocityFaces(velocityFaces, x, y, 4);
+            if (!samples.length) {
+                return null;
+            }
+
+            let absSum = 0;
+            let minDist2 = Number.POSITIVE_INFINITY;
+            for (let i = 0; i < samples.length; i += 1) {
+                absSum += Math.abs(samples[i].velocity);
+                minDist2 = Math.min(minDist2, samples[i].dist2);
+            }
+
+            return {
+                estimatedVelocity: absSum / samples.length,
+                sampleCount: samples.length,
+                nearestDistanceM: Number.isFinite(minDist2) ? Math.sqrt(minDist2) : null,
+            };
+        },
+
+        handleCanvasClick(event) {
+            const bridge = RuntimeState.bridge;
+            if (!bridge || !bridge.camera || !bridge.renderer || !RuntimeState.overlay) {
+                this.hidePanel();
+                return;
+            }
+
+            const payload = RuntimeState.lastPayload;
+            if (!payload || !Array.isArray(payload.points) || payload.points.length === 0) {
+                this.hidePanel();
+                return;
+            }
+
+            const canvas = bridge.renderer.domElement;
+            if (!canvas) {
+                this.hidePanel();
+                return;
+            }
+
+            const rect = canvas.getBoundingClientRect();
+            if (!rect || rect.width <= 0 || rect.height <= 0) {
+                this.hidePanel();
+                return;
+            }
+
+            this.state.pointerNdc.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            this.state.pointerNdc.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+            this.state.raycaster.setFromCamera(this.state.pointerNdc, bridge.camera);
+
+            const intersections = this.state.raycaster.intersectObject(RuntimeState.overlay, true);
+            if (!Array.isArray(intersections) || intersections.length === 0) {
+                this.hidePanel();
+                return;
+            }
+
+            const hit = intersections[0];
+            const hitX = Number(hit.point && hit.point.x);
+            const hitY = Number(hit.point && hit.point.y);
+            if (!Number.isFinite(hitX) || !Number.isFinite(hitY)) {
+                this.hidePanel();
+                return;
+            }
+
+            const nearestDepth = this.findNearestDepthPoint(payload.points, hitX, hitY);
+            if (!nearestDepth || !Array.isArray(nearestDepth.point)) {
+                this.hidePanel();
+                return;
+            }
+
+            const velocityEstimation = this.estimateVelocityByFaces(payload.velocity_faces, hitX, hitY);
+            this.setPanelText("xy", `${this.formatNumber(hitX, 2)}, ${this.formatNumber(hitY, 2)}`);
+            const depthValue = Number(nearestDepth.point[4]);
+            this.setPanelText("depth", Number.isFinite(depthValue) ? this.formatNumber(depthValue, 3, " m") : "--");
+
+            if (velocityEstimation) {
+                this.setPanelText("velocity", this.formatNumber(velocityEstimation.estimatedVelocity, 3, " m/s"));
+            } else {
+                this.setPanelText("velocity", "--");
+            }
+
+            this.showPanelAt(event.clientX, event.clientY);
+        },
+
+        bind(bridge) {
+            if (this.state.isBound || !bridge || !bridge.renderer || !bridge.camera) {
+                return;
+            }
+            const canvas = bridge.renderer.domElement;
+            if (!canvas) {
+                return;
+            }
+            this.ensurePanel();
+            this.state.raycaster.params.Points.threshold = 9;
+            canvas.addEventListener("click", (event) => {
+                this.handleCanvasClick(event);
+            });
+            this.state.isBound = true;
         },
     };
 
@@ -1027,6 +1446,25 @@
      * Flow: bootstrap -> bind listeners -> fetch frame -> render overlay.
      */
     const RuntimeModule = {
+        prefetchAhead(payload) {
+            if (!payload || !RuntimeState.projectId) {
+                return;
+            }
+            const nowIndex = Number(payload.time_index);
+            const timeStepCount = Number(payload.time_step_count);
+            if (!Number.isFinite(nowIndex) || !Number.isFinite(timeStepCount) || timeStepCount <= 0) {
+                return;
+            }
+
+            for (let offset = 1; offset <= HDF_PREFETCH_AHEAD_COUNT; offset += 1) {
+                const nextIndex = Math.trunc(nowIndex) + offset;
+                if (nextIndex >= timeStepCount) {
+                    break;
+                }
+                DataModule.prefetchWaterDepthPayload(RuntimeState.projectId, nextIndex);
+            }
+        },
+
         stopPlayback() {
             if (RuntimeState.playbackTimerId) {
                 window.clearTimeout(RuntimeState.playbackTimerId);
@@ -1044,6 +1482,7 @@
             }
             RuntimeState.isPlaying = true;
             TimelineModule.createOrUpdateUi(TimelineModule.state.timeStepCount, TimelineModule.state.selectedTimeIndex);
+            this.prefetchAhead(RuntimeState.lastPayload);
 
             const tick = async () => {
                 if (!RuntimeState.isPlaying) {
@@ -1121,9 +1560,12 @@
                     return;
                 }
 
-                DataModule.logPointSample(payload);
-                DiagnosticsModule.logSummary(payload);
+                if (HDF_VERBOSE_FRAME_LOG || !RuntimeState.isPlaying) {
+                    DataModule.logPointSample(payload);
+                    DiagnosticsModule.logSummary(payload);
+                }
                 RuntimeState.lastPayload = payload;
+                this.prefetchAhead(payload);
                 TimelineModule.createOrUpdateUi(payload.time_step_count, payload.time_index);
                 if (RuntimeState.isPlaying && payload.time_index >= payload.time_step_count - 1) {
                     this.stopPlayback();
@@ -1320,8 +1762,10 @@
             this.setRenderMode(DataModule.resolveRenderModeFromUrl());
             RuntimeState.cacheMode = DataModule.resolveCacheModeFromUrl();
             RuntimeState.playbackIntervalMs = DataModule.resolvePlaybackIntervalFromUrl();
+            DataModule.clearPayloadCache();
             RuntimeState.bridge = bridge;
             RuntimeState.projectId = projectId;
+            InteractionModule.bind(bridge);
 
             this.bindExportEvent();
             this.bindAutoRecordWhenDrawCallsOne();
@@ -1336,9 +1780,12 @@
 
             const payload = await DataModule.fetchWaterDepthPayload(projectId, HDF_INITIAL_TIME_INDEX);
             RuntimeState.lastPayload = payload;
+            this.prefetchAhead(payload);
             TimelineModule.createOrUpdateUi(payload.time_step_count, payload.time_index);
-            DataModule.logPointSample(payload);
-            DiagnosticsModule.logSummary(payload);
+            if (HDF_VERBOSE_FRAME_LOG) {
+                DataModule.logPointSample(payload);
+                DiagnosticsModule.logSummary(payload);
+            }
 
             this.bindTimelineEvent();
             this.bindRenderModeEvent();
