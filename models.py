@@ -79,6 +79,21 @@ class Project(Base):
         nullable=True,
         default=None,
     )
+    hydro_label: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        default=None,
+    )
+    hydro_label_confidence: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+        default=None,
+    )
+    hydro_label_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+    )
     bbox_minx: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     bbox_miny: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     bbox_maxx: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)

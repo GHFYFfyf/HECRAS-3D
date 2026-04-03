@@ -25,7 +25,7 @@
     const HDF_PAYLOAD_CACHE_LIMIT = 20;
     const HDF_PREFETCH_AHEAD_COUNT = 2;
     const HDF_VERBOSE_FRAME_LOG = false;
-    const HDF_LOAD_ENABLED = true;
+    const HDF_LOAD_ENABLED = false;
     const AUTO_WRITE_WHEN_DRAWCALLS_EQ = 1;
     const AUTO_WRITE_COOLDOWN_MS = 12000;
     const SURFACE_GRID_MIN = 96;

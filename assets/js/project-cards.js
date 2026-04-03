@@ -183,10 +183,35 @@
         }).format(date);
     }
 
+    function escapeHtml(value) {
+        return String(value)
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;")
+            .replaceAll('"', "&quot;")
+            .replaceAll("'", "&#39;");
+    }
+
+    function formatHydroLabel(project) {
+        const rawLabel = typeof project?.hydro_label === "string" ? project.hydro_label.trim() : "";
+        const normalizedMap = {
+            "平稳": "稳态",
+            "稳定": "稳态",
+            "枯水": "干枯",
+        };
+        const candidate = normalizedMap[rawLabel] || rawLabel;
+        const vocab = ["退水", "涨水", "泄洪", "干枯", "稳态"];
+        if (vocab.includes(candidate)) {
+            return candidate;
+        }
+        return "稳态";
+    }
+
     function createProjectCard(project) {
         const card = document.createElement("article");
         card.className = "card-bg card-active rounded-xl p-4 cursor-pointer group";
         card.dataset.projectId = String(project.id);
+        const hydroLabelText = escapeHtml(formatHydroLabel(project));
 
         card.addEventListener("click", () => {
             if (typeof window.focusProjectOnGlobe === "function") {
@@ -201,7 +226,7 @@
                     <div class="min-w-0">
                         <h3 class="text-base font-semibold text-gray-100 truncate">${project.name}</h3>
                         <p class="text-[12px] text-gray-500 mt-1">创建于 ${formatDate(project.created_at)}</p>
-                        <div class="mt-3 flex gap-2"><span class="label-chip">退水</span></div>
+                        <div class="mt-3 flex gap-2"><span class="label-chip">${hydroLabelText}</span></div>
                     </div>
                 </div>
                 <div class="flex items-center justify-center gap-3 flex-shrink-0 self-center ml-auto">

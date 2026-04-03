@@ -82,6 +82,109 @@ body.modal-open > main {
     letter-spacing: 0.02em;
 }
 
+.hydro-overview-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.9rem;
+}
+
+.hydro-ai-inline {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    min-width: 0;
+}
+
+.label-ai-trigger {
+    border: none;
+    outline: none;
+    background: transparent;
+    padding: 0.1rem 0.2rem;
+    line-height: 1;
+    cursor: pointer;
+    user-select: none;
+    transition: transform 0.18s ease, filter 0.18s ease;
+}
+
+.label-ai-trigger:hover {
+    transform: translateY(-1px) scale(1.03);
+    filter: brightness(1.08);
+}
+
+.label-ai-trigger:active {
+    transform: translateY(0) scale(0.98);
+}
+
+.label-ai-trigger:focus-visible {
+    box-shadow: 0 0 0 2px rgba(149, 219, 255, 0.32);
+    border-radius: 0.38rem;
+}
+
+.label-ai-trigger[aria-busy="true"] {
+    pointer-events: none;
+    opacity: 0.84;
+}
+
+.label-ai-trigger__text {
+    display: inline-block;
+    font-size: 16px;
+    font-weight: 800;
+    font-style: italic;
+    letter-spacing: 0.03em;
+    background: linear-gradient(92deg, #66ebff 0%, #82a9ff 46%, #86ffc4 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    text-shadow:
+        0 0 16px rgba(102, 235, 255, 0.46),
+        0 0 24px rgba(124, 146, 255, 0.28);
+    animation: ai-pulse 2.2s ease-in-out infinite;
+}
+
+.hydro-ai-bubble {
+    min-width: 0;
+    flex: 1;
+}
+
+.hydro-ai-bubble__text {
+    margin: 0;
+    color: #b5d7ea;
+    font-size: 11px;
+    line-height: 1.45;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.hydro-ai-bubble.is-error {
+    color: #ffc2c2;
+}
+
+.hydro-ai-bubble.is-error .hydro-ai-bubble__text {
+    color: #ffc2c2;
+}
+
+@keyframes ai-pulse {
+    0% {
+        text-shadow:
+            0 0 12px rgba(102, 235, 255, 0.3),
+            0 0 18px rgba(124, 146, 255, 0.18);
+    }
+    50% {
+        text-shadow:
+            0 0 18px rgba(102, 235, 255, 0.6),
+            0 0 26px rgba(124, 146, 255, 0.32);
+    }
+    100% {
+        text-shadow:
+            0 0 12px rgba(102, 235, 255, 0.3),
+            0 0 18px rgba(124, 146, 255, 0.18);
+    }
+}
+
 .chart-shell {
     min-width: 0;
     border: 1px solid rgba(255, 255, 255, 0.12);
@@ -324,9 +427,32 @@ button.action-pill:hover,
         grid-template-columns: repeat(2, minmax(0, 1fr));
         height: 190px !important;
     }
+
+    .hydro-overview-head {
+        flex-wrap: wrap;
+        align-items: center;
+    }
+
+    .hydro-ai-bubble {
+        min-width: 220px;
+    }
 }
 
 @media (max-width: 920px) {
+    .hydro-overview-head {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+
+    .hydro-ai-inline {
+        width: 100%;
+        align-items: flex-start;
+    }
+
+    .hydro-ai-bubble {
+        width: 100%;
+    }
+
     .hydro-charts-grid {
         grid-template-columns: repeat(1, minmax(0, 1fr));
         height: 310px !important;

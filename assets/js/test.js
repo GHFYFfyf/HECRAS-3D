@@ -17,12 +17,15 @@ document.addEventListener("DOMContentLoaded", async () => {
     let latestStatsPayload = null;
     let latestGridSummary = null;
     let latestFlowPayload = null;
+    let hydroAiTriggerButton = null;
+    let hydroAiTriggerText = null;
+    let hydroAiBubble = null;
+    let hydroAiBubbleText = null;
+    let hydroAiRequestToken = 0;
     const mercatorProjection = new Cesium.WebMercatorProjection();
 
     // Grant CesiumJS access to your ion assets
     Cesium.Ion.defaultAccessToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiIwMjc0YjQ0MS0wOTliLTQ3ZGQtYmZhMi05YTdlYTM5MWUyYmUiLCJpZCI6MzQ5Mjk1LCJpYXQiOjE3NjExODM2Njl9.xKRoBHBK6rfDy85asmx50omBvFw96N48Vq0Z85U9hys";
-
-    // Initialize Cesium Viewer
     let viewer;
 
     try {
@@ -124,6 +127,119 @@ document.addEventListener("DOMContentLoaded", async () => {
             if (velocityHistogramChart) {
                 velocityHistogramChart.resize();
             }
+        });
+    }
+
+    function ensureHydroAiElements() {
+        if (!hydroAiTriggerButton) {
+            hydroAiTriggerButton = document.getElementById("label-ai-trigger");
+        }
+        if (!hydroAiTriggerText && hydroAiTriggerButton) {
+            hydroAiTriggerText = hydroAiTriggerButton.querySelector(".label-ai-trigger__text");
+        }
+        if (!hydroAiBubble) {
+            hydroAiBubble = document.getElementById("hydroAiInsightBubble");
+        }
+        if (!hydroAiBubbleText) {
+            hydroAiBubbleText = document.getElementById("hydroAiInsightText");
+        }
+    }
+
+    function setHydroAiButtonLoading(isLoading) {
+        ensureHydroAiElements();
+        if (!hydroAiTriggerButton) {
+            return;
+        }
+        hydroAiTriggerButton.setAttribute("aria-busy", isLoading ? "true" : "false");
+        hydroAiTriggerButton.disabled = Boolean(isLoading);
+        if (hydroAiTriggerText) {
+            hydroAiTriggerText.textContent = isLoading ? "AI总结..." : "AI总结";
+        }
+    }
+
+    function renderHydroAiBubble({ text, isError = false }) {
+        ensureHydroAiElements();
+        if (!hydroAiBubble || !hydroAiBubbleText) {
+            return;
+        }
+
+        hydroAiBubble.classList.toggle("is-error", Boolean(isError));
+        hydroAiBubbleText.textContent = text || "暂无可用概括。";
+    }
+
+    async function fetchHydroAiSummaryPayload(projectId) {
+        const response = await fetch(
+            `/api/projects/${encodeURIComponent(projectId)}/hydro-ai-summary`,
+            { headers: { Accept: "application/json" } }
+        );
+
+        if (!response.ok) {
+            throw new Error(`Failed to load hydro AI summary: ${response.status}`);
+        }
+        return response.json();
+    }
+
+    async function handleHydroAiTriggerClick() {
+        if (!activeProjectId) {
+            renderHydroAiBubble({
+                text: "请先点击一个项目卡片，再发起 AI总结。",
+                isError: true,
+            });
+            return;
+        }
+
+        const requestToken = hydroAiRequestToken + 1;
+        hydroAiRequestToken = requestToken;
+        setHydroAiButtonLoading(true);
+        renderHydroAiBubble({
+            text: "正在读取流量曲线并生成评价...",
+            isError: false,
+        });
+
+        try {
+            const payload = await fetchHydroAiSummaryPayload(activeProjectId);
+            if (requestToken !== hydroAiRequestToken) {
+                return;
+            }
+
+            const summaryText = typeof payload?.summary_text === "string" && payload.summary_text.trim()
+                ? payload.summary_text.trim()
+                : "暂无可用概括。";
+            const geoTextRaw = typeof payload?.geo_insight === "string" ? payload.geo_insight.trim() : "";
+            const levelTextRaw = typeof payload?.water_level_assessment === "string" ? payload.water_level_assessment.trim() : "";
+
+            const mergedText = [summaryText, geoTextRaw, levelTextRaw]
+                .filter((part) => typeof part === "string" && part.length > 0)
+                .join(" ");
+
+            renderHydroAiBubble({
+                text: mergedText || "暂无可用概括。",
+                isError: !payload?.found,
+            });
+        } catch (error) {
+            console.error("Hydro AI summary request failed:", error);
+            if (requestToken !== hydroAiRequestToken) {
+                return;
+            }
+            renderHydroAiBubble({
+                text: "AI 请求失败，请稍后重试。",
+                isError: true,
+            });
+        } finally {
+            if (requestToken === hydroAiRequestToken) {
+                setHydroAiButtonLoading(false);
+            }
+        }
+    }
+
+    function initHydroAiControls() {
+        ensureHydroAiElements();
+        if (!hydroAiTriggerButton) {
+            return;
+        }
+
+        hydroAiTriggerButton.addEventListener("click", () => {
+            handleHydroAiTriggerClick();
         });
     }
 
@@ -759,9 +875,17 @@ document.addEventListener("DOMContentLoaded", async () => {
             return;
         }
 
+        const nextProjectId = String(project.id);
+        if (activeProjectId && activeProjectId !== nextProjectId) {
+            renderHydroAiBubble({
+                text: "点击 AI总结 获取右侧评价",
+                isError: false,
+            });
+        }
+
         stopAutoRotate();
 
-        activeProjectId = String(project.id);
+        activeProjectId = nextProjectId;
         renderProjectExtents(window.projectCardsData || []);
 
         const rectangleDestination = viewer.camera.getRectangleCameraCoordinates(rectangle);
@@ -824,5 +948,6 @@ document.addEventListener("DOMContentLoaded", async () => {
         renderProjectExtents(window.projectCardsData);
     }
 
+    initHydroAiControls();
     resetHydraulicStats();
 });

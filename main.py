@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import io
+import json
+import os
 from pathlib import Path
 from threading import Lock
 from time import perf_counter
 from typing import Any
+from urllib import error as urlerror
+from urllib import request as urlrequest
 import zipfile
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape as xml_escape
@@ -17,6 +21,8 @@ from fastapi.templating import Jinja2Templates
 import h5py
 import rasterio
 import numpy as np
+from rasterio.crs import CRS
+from rasterio.warp import transform as rio_transform
 from rasterio.windows import Window
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -58,6 +64,15 @@ FLOW_HDF_SUFFIX_PRIORITY = (
 	".hdf",
 	".p01.hdf",
 )
+HYDRO_LABEL_VOCAB = ("退水", "涨水", "泄洪", "干枯", "稳态")
+HYDRO_LABEL_SYNONYMS = {
+	"平稳": "稳态",
+	"稳定": "稳态",
+	"稳": "稳态",
+	"枯水": "干枯",
+	"上涨": "涨水",
+	"下泄": "泄洪",
+}
 XN_XLSX_PATH = BASE_DIR / "xn.xlsx"
 _XN_XLSX_LOCK = Lock()
 _XN_XLSX_HEADERS = [
@@ -505,6 +520,9 @@ def _ensure_projects_table_columns() -> None:
 		"flow_hdf_path": "TEXT",
 		"flow_hydrograph_ref": "TEXT",
 		"flow_time_ref": "TEXT",
+		"hydro_label": "TEXT",
+		"hydro_label_confidence": "REAL",
+		"hydro_label_updated_at": "TEXT",
 	}
 	with engine.begin() as connection:
 		rows = connection.exec_driver_sql("PRAGMA table_info(projects)").fetchall()
@@ -513,6 +531,21 @@ def _ensure_projects_table_columns() -> None:
 			if column_name in existing_columns:
 				continue
 			connection.exec_driver_sql(f"ALTER TABLE projects ADD COLUMN {column_name} {column_type}")
+
+
+def _prune_projects_table_columns() -> None:
+	deprecated_columns = {"hydro_label_reason"}
+	with engine.begin() as connection:
+		rows = connection.exec_driver_sql("PRAGMA table_info(projects)").fetchall()
+		existing_columns = {str(row[1]) for row in rows}
+		for column_name in deprecated_columns:
+			if column_name not in existing_columns:
+				continue
+			try:
+				connection.exec_driver_sql(f"ALTER TABLE projects DROP COLUMN {column_name}")
+			except Exception:
+				# Keep compatibility with SQLite versions that do not support DROP COLUMN.
+				continue
 
 
 def _split_hdf_base_name(file_name: str) -> str:
@@ -673,6 +706,719 @@ def _extract_flow_hydrograph_series(
 	}
 
 
+def _normalize_hydro_label(label: Any) -> str:
+	raw_label = str(label).strip() if label is not None else ""
+	if raw_label in HYDRO_LABEL_VOCAB:
+		return raw_label
+	mapped = HYDRO_LABEL_SYNONYMS.get(raw_label, "")
+	if mapped in HYDRO_LABEL_VOCAB:
+		return mapped
+	return "稳态"
+
+
+def _clamp_confidence(value: Any, default: float = 0.5) -> float:
+	try:
+		numeric = float(value)
+	except (TypeError, ValueError):
+		return float(max(0.0, min(1.0, default)))
+	if not np.isfinite(numeric):
+		return float(max(0.0, min(1.0, default)))
+	return float(max(0.0, min(1.0, numeric)))
+
+
+def _resolve_hydro_model_config() -> tuple[str, str, str]:
+	api_key = (os.getenv("HYDRO_LABEL_MODEL_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or "").strip()
+	model_name = (
+		os.getenv("HYDRO_LABEL_MODEL_NAME")
+		or os.getenv("DEEPSEEK_MODEL")
+		or "deepseek-chat"
+	).strip()
+	base_url = (
+		os.getenv("HYDRO_LABEL_MODEL_BASE_URL")
+		or os.getenv("DEEPSEEK_BASE_URL")
+		or "https://api.deepseek.com"
+	).strip().rstrip("/")
+	return api_key, model_name, base_url
+
+
+def _default_hydro_label_mode() -> str:
+	raw_mode = str(os.getenv("HYDRO_LABEL_DEFAULT_MODE") or "hybrid").strip().lower()
+	if raw_mode in {"rule", "ai", "hybrid"}:
+		return raw_mode
+	return "hybrid"
+
+
+def _to_wgs84_point(x: float, y: float, source_crs_text: str | None) -> tuple[float | None, float | None]:
+	if not source_crs_text:
+		return None, None
+	if not (np.isfinite(x) and np.isfinite(y)):
+		return None, None
+	try:
+		source_crs = CRS.from_user_input(source_crs_text)
+		if source_crs is None:
+			return None, None
+		lon_values, lat_values = rio_transform(source_crs, CRS.from_epsg(4326), [x], [y])
+		if len(lon_values) == 0 or len(lat_values) == 0:
+			return None, None
+		lon = float(lon_values[0])
+		lat = float(lat_values[0])
+		if not (np.isfinite(lon) and np.isfinite(lat)):
+			return None, None
+		return lon, lat
+	except Exception:
+		return None, None
+
+
+def _build_project_geo_context(project: Project) -> dict[str, Any]:
+	minx = project.bbox_minx
+	miny = project.bbox_miny
+	maxx = project.bbox_maxx
+	maxy = project.bbox_maxy
+	has_bbox = all(v is not None for v in (minx, miny, maxx, maxy))
+	center_x = ((float(minx) + float(maxx)) / 2.0) if has_bbox else None
+	center_y = ((float(miny) + float(maxy)) / 2.0) if has_bbox else None
+	center_lon = None
+	center_lat = None
+	if center_x is not None and center_y is not None:
+		center_lon, center_lat = _to_wgs84_point(center_x, center_y, project.crs)
+	return {
+		"name": project.name,
+		"crs": project.crs,
+		"bbox": {
+			"minx": minx,
+			"miny": miny,
+			"maxx": maxx,
+			"maxy": maxy,
+		},
+		"center": {
+			"x": center_x,
+			"y": center_y,
+		},
+		"center_wgs84": {
+			"lon": center_lon,
+			"lat": center_lat,
+		},
+	}
+
+
+def _extract_json_object_from_text(text: str) -> dict[str, Any] | None:
+	if not text:
+		return None
+	trimmed = text.strip()
+	for candidate in (trimmed,):
+		try:
+			obj = json.loads(candidate)
+			return obj if isinstance(obj, dict) else None
+		except Exception:
+			pass
+	start = trimmed.find("{")
+	end = trimmed.rfind("}")
+	if start >= 0 and end > start:
+		snippet = trimmed[start : end + 1]
+		try:
+			obj = json.loads(snippet)
+			return obj if isinstance(obj, dict) else None
+		except Exception:
+			return None
+	return None
+
+
+def _call_hydro_label_model(
+	*,
+	project: Project,
+	rule_payload: dict[str, Any],
+) -> dict[str, Any] | None:
+	api_key, model_name, base_url = _resolve_hydro_model_config()
+	if not api_key or not model_name:
+		return None
+	series = rule_payload.get("series") if isinstance(rule_payload.get("series"), list) else []
+	if len(series) > 240:
+		series = series[-240:]
+
+	model_input = {
+		"project": _build_project_geo_context(project),
+		"flow": {
+			"time_unit": rule_payload.get("time_unit", "hour"),
+			"time_interval_hour": rule_payload.get("time_interval_hour", 1),
+			"sample_count": len(series),
+			"series": series,
+			"peak_flow": rule_payload.get("peak_flow"),
+			"peak_time": rule_payload.get("peak_time"),
+			"current_flow": rule_payload.get("current_flow"),
+			"current_time": rule_payload.get("current_time"),
+			"avg_flow": rule_payload.get("avg_flow"),
+		},
+		"vocab": list(HYDRO_LABEL_VOCAB),
+	}
+
+	system_prompt = (
+		"你是水文状态分类器。"
+		"必须只从词库中选择一个标签：退水、涨水、泄洪、干枯、稳态。"
+		"请综合流量曲线与地理上下文判断最接近的标签。"
+		"地理信息里 center_wgs84 是大致经纬度。"
+		"输出严格JSON对象："
+		"{\"label\":\"<词库中的一个>\",\"confidence\":0到1小数,\"reason\":\"一句中文理由\"}"
+	)
+
+	request_payload = {
+		"model": model_name,
+		"temperature": 0.1,
+		"messages": [
+			{"role": "system", "content": system_prompt},
+			{"role": "user", "content": json.dumps(model_input, ensure_ascii=False)},
+		],
+	}
+
+	request_data = json.dumps(request_payload, ensure_ascii=False).encode("utf-8")
+	req = urlrequest.Request(
+		url=f"{base_url}/chat/completions",
+		data=request_data,
+		headers={
+			"Authorization": f"Bearer {api_key}",
+			"Content-Type": "application/json",
+		},
+		method="POST",
+	)
+
+	try:
+		with urlrequest.urlopen(req, timeout=30) as resp:
+			resp_text = resp.read().decode("utf-8")
+	except (urlerror.URLError, TimeoutError, OSError):
+		return None
+
+	try:
+		resp_json = json.loads(resp_text)
+	except Exception:
+		return None
+
+	choices = resp_json.get("choices") if isinstance(resp_json, dict) else None
+	if not isinstance(choices, list) or not choices:
+		return None
+	message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+	content = message.get("content", "")
+	if isinstance(content, list):
+		parts = []
+		for item in content:
+			if isinstance(item, dict):
+				text_part = item.get("text")
+				if isinstance(text_part, str):
+					parts.append(text_part)
+		content = "\n".join(parts)
+	if not isinstance(content, str):
+		return None
+
+	parsed = _extract_json_object_from_text(content)
+	if not parsed:
+		return None
+
+	label = _normalize_hydro_label(parsed.get("label"))
+	confidence = _clamp_confidence(parsed.get("confidence"), default=0.65)
+	reason = str(parsed.get("reason") or "模型已完成判别。")
+	return {
+		"hydro_label": label,
+		"confidence": confidence,
+		"reason": reason,
+		"label_source": "ai",
+		"model_name": model_name,
+	}
+
+
+def _build_geo_insight_text(project: Project) -> str:
+	geo_context = _build_project_geo_context(project)
+	center = geo_context.get("center_wgs84") or {}
+	center_lon = center.get("lon")
+	center_lat = center.get("lat")
+	if isinstance(center_lon, (int, float)) and isinstance(center_lat, (int, float)):
+		if np.isfinite(center_lon) and np.isfinite(center_lat):
+			return f"地理位置：项目中心约东经{float(center_lon):.2f}°、北纬{float(center_lat):.2f}°。"
+
+	plane_center = geo_context.get("center") or {}
+	center_x = plane_center.get("x")
+	center_y = plane_center.get("y")
+	if isinstance(center_x, (int, float)) and isinstance(center_y, (int, float)):
+		if np.isfinite(center_x) and np.isfinite(center_y):
+			return f"地理位置：中心平面坐标约为 x={float(center_x):.0f}, y={float(center_y):.0f}。"
+
+	return "地理位置：坐标信息不足，暂无法估算中心经纬度。"
+
+
+def _build_water_level_assessment_text(rule_payload: dict[str, Any]) -> str:
+	current_flow_raw = rule_payload.get("current_flow")
+	peak_flow_raw = rule_payload.get("peak_flow")
+	avg_flow_raw = rule_payload.get("avg_flow")
+	label = _normalize_hydro_label(rule_payload.get("hydro_label"))
+
+	current_flow = float(current_flow_raw) if isinstance(current_flow_raw, (int, float)) else float("nan")
+	peak_flow = float(peak_flow_raw) if isinstance(peak_flow_raw, (int, float)) else float("nan")
+	avg_flow = float(avg_flow_raw) if isinstance(avg_flow_raw, (int, float)) else float("nan")
+
+	if not np.isfinite(current_flow):
+		return f"水位评价：缺少有效流量序列，暂按{label}态势看待。"
+
+	if np.isfinite(peak_flow) and peak_flow > 0:
+		ratio = current_flow / peak_flow
+		if ratio >= 0.85:
+			level_text = "高位"
+		elif ratio >= 0.6:
+			level_text = "中高位"
+		elif ratio >= 0.35:
+			level_text = "中位"
+		else:
+			level_text = "低位"
+		return (
+			f"水位评价：当前入流约{current_flow:.0f} m3/s，"
+			f"相对峰值约{ratio * 100:.0f}%，处于{level_text}并呈{label}趋势。"
+		)
+
+	if np.isfinite(avg_flow) and avg_flow > 0:
+		if current_flow >= avg_flow * 1.15:
+			level_text = "偏高"
+		elif current_flow <= avg_flow * 0.75:
+			level_text = "偏低"
+		else:
+			level_text = "中位"
+		return f"水位评价：当前入流约{current_flow:.0f} m3/s，相对均值处于{level_text}并呈{label}趋势。"
+
+	return f"水位评价：当前入流约{current_flow:.0f} m3/s，整体以{label}态势为主。"
+
+
+def _call_hydro_summary_model(
+	*,
+	project: Project,
+	rule_payload: dict[str, Any],
+) -> dict[str, Any] | None:
+	api_key, model_name, base_url = _resolve_hydro_model_config()
+	if not api_key or not model_name:
+		return None
+
+	series = rule_payload.get("series") if isinstance(rule_payload.get("series"), list) else []
+	if len(series) > 168:
+		series = series[-168:]
+
+	geo_context = _build_project_geo_context(project)
+	model_input = {
+		"project": geo_context,
+		"flow": {
+			"time_unit": rule_payload.get("time_unit", "hour"),
+			"time_interval_hour": rule_payload.get("time_interval_hour", 1),
+			"sample_count": len(series),
+			"series": series,
+			"peak_flow": rule_payload.get("peak_flow"),
+			"peak_time": rule_payload.get("peak_time"),
+			"current_flow": rule_payload.get("current_flow"),
+			"current_time": rule_payload.get("current_time"),
+			"avg_flow": rule_payload.get("avg_flow"),
+		},
+		"rule_label": _normalize_hydro_label(rule_payload.get("hydro_label")),
+	}
+
+	system_prompt = (
+		"你是水文分析助手。"
+		"请根据流量曲线和项目地理信息，给出极简、可读的现场判断。"
+		"必须输出严格JSON对象，格式为："
+		"{\"summary\":\"不超过36字\",\"geo\":\"不超过28字\",\"water_level\":\"不超过36字\"}。"
+		"其中 geo 必须体现大致经纬度或地理方位，water_level 必须包含水位/流量高低评价。"
+	)
+
+	request_payload = {
+		"model": model_name,
+		"temperature": 0.25,
+		"messages": [
+			{"role": "system", "content": system_prompt},
+			{"role": "user", "content": json.dumps(model_input, ensure_ascii=False)},
+		],
+	}
+
+	request_data = json.dumps(request_payload, ensure_ascii=False).encode("utf-8")
+	req = urlrequest.Request(
+		url=f"{base_url}/chat/completions",
+		data=request_data,
+		headers={
+			"Authorization": f"Bearer {api_key}",
+			"Content-Type": "application/json",
+		},
+		method="POST",
+	)
+
+	try:
+		with urlrequest.urlopen(req, timeout=30) as resp:
+			resp_text = resp.read().decode("utf-8")
+	except (urlerror.URLError, TimeoutError, OSError):
+		return None
+
+	try:
+		resp_json = json.loads(resp_text)
+	except Exception:
+		return None
+
+	choices = resp_json.get("choices") if isinstance(resp_json, dict) else None
+	if not isinstance(choices, list) or not choices:
+		return None
+	message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+	content = message.get("content", "")
+	if isinstance(content, list):
+		parts = []
+		for item in content:
+			if isinstance(item, dict):
+				text_part = item.get("text")
+				if isinstance(text_part, str):
+					parts.append(text_part)
+		content = "\n".join(parts)
+	if not isinstance(content, str):
+		return None
+
+	parsed = _extract_json_object_from_text(content)
+	if not parsed:
+		return None
+
+	summary_text = str(parsed.get("summary") or "").strip()
+	geo_insight = str(parsed.get("geo") or "").strip()
+	water_level_assessment = str(parsed.get("water_level") or "").strip()
+
+	if not summary_text and not geo_insight and not water_level_assessment:
+		return None
+
+	return {
+		"summary_text": summary_text or "AI 已完成本轮水动力摘要。",
+		"geo_insight": geo_insight or _build_geo_insight_text(project),
+		"water_level_assessment": water_level_assessment or _build_water_level_assessment_text(rule_payload),
+		"source": "ai",
+		"model_name": model_name,
+	}
+
+
+def _build_hydro_summary_fallback(project: Project, rule_payload: dict[str, Any]) -> dict[str, Any]:
+	label = _normalize_hydro_label(rule_payload.get("hydro_label"))
+	summary_text = f"当前水动力判定为{label}，建议持续关注未来6小时入流变化。"
+	return {
+		"summary_text": summary_text,
+		"geo_insight": _build_geo_insight_text(project),
+		"water_level_assessment": _build_water_level_assessment_text(rule_payload),
+		"source": "rule-fallback",
+		"model_name": None,
+	}
+
+
+def _compute_project_hydro_ai_summary(*, project: Project, db: Session) -> dict[str, Any]:
+	project_hdf_path = Path(project.hdf_path).resolve()
+	if not project_hdf_path.exists():
+		return {
+			"project_id": project.id,
+			"found": False,
+			"summary_text": "项目 HDF 文件不存在，无法进行 AI 概括。",
+			"geo_insight": _build_geo_insight_text(project),
+			"water_level_assessment": "水位评价：缺少可计算的流量数据。",
+			"source": "rule-fallback",
+			"model_name": None,
+		}
+
+	source_hdf_path = Path(project.flow_hdf_path).resolve() if project.flow_hdf_path else None
+	flow_hydrograph_ref = project.flow_hydrograph_ref
+	flow_time_ref = project.flow_time_ref
+
+	need_refresh = (
+		source_hdf_path is None
+		or not source_hdf_path.exists()
+		or not flow_hydrograph_ref
+	)
+	if need_refresh:
+		source_hdf_path, flow_hydrograph_ref, flow_time_ref = _resolve_project_flow_source(project_hdf_path)
+		if source_hdf_path and flow_hydrograph_ref:
+			project.flow_hdf_path = str(source_hdf_path)
+			project.flow_hydrograph_ref = flow_hydrograph_ref
+			project.flow_time_ref = flow_time_ref
+			db.add(project)
+			try:
+				db.commit()
+			except Exception:
+				db.rollback()
+
+	if source_hdf_path is None or flow_hydrograph_ref is None:
+		return {
+			"project_id": project.id,
+			"found": False,
+			"summary_text": "未发现可用的上游非恒定流曲线，无法生成 AI 概括。",
+			"geo_insight": _build_geo_insight_text(project),
+			"water_level_assessment": "水位评价：暂缺入流曲线，建议先校验边界条件。",
+			"source": "rule-fallback",
+			"model_name": None,
+		}
+
+	rule_payload = _judge_hydro_label_from_source(
+		source_hdf_path=source_hdf_path,
+		flow_hydrograph_ref=flow_hydrograph_ref,
+		flow_time_ref=flow_time_ref,
+	)
+
+	ai_summary = _call_hydro_summary_model(project=project, rule_payload=rule_payload)
+	fallback_summary = _build_hydro_summary_fallback(project, rule_payload)
+	summary_payload = ai_summary or fallback_summary
+	geo_context = _build_project_geo_context(project)
+
+	return {
+		"project_id": project.id,
+		"found": True,
+		"hydro_label": _normalize_hydro_label(rule_payload.get("hydro_label")),
+		"summary_text": summary_payload.get("summary_text"),
+		"geo_insight": summary_payload.get("geo_insight"),
+		"water_level_assessment": summary_payload.get("water_level_assessment"),
+		"source": summary_payload.get("source"),
+		"model_name": summary_payload.get("model_name"),
+		"center_wgs84": geo_context.get("center_wgs84"),
+		"current_flow": rule_payload.get("current_flow"),
+		"peak_flow": rule_payload.get("peak_flow"),
+	}
+
+
+def _classify_hydro_state_from_series(series: list[list[float]]) -> dict[str, Any]:
+	if not series:
+		return {
+			"hydro_label": "稳态",
+			"confidence": 0.2,
+			"reason": "缺少有效流量序列，默认按稳态处理。",
+		}
+
+	arr = np.asarray(series, dtype=np.float64)
+	if arr.ndim != 2 or arr.shape[1] < 2:
+		return {
+			"hydro_label": "稳态",
+			"confidence": 0.2,
+			"reason": "流量序列结构异常，默认按稳态处理。",
+		}
+
+	time_axis = arr[:, 0]
+	flow_abs = np.abs(arr[:, 1])
+	if flow_abs.size == 0 or not np.isfinite(flow_abs).any():
+		return {
+			"hydro_label": "稳态",
+			"confidence": 0.2,
+			"reason": "流量序列无有效值，默认按稳态处理。",
+		}
+
+	q_start = float(flow_abs[0])
+	q_end = float(flow_abs[-1])
+	q_peak = float(np.nanmax(flow_abs))
+	q_mean = float(np.nanmean(flow_abs))
+	q_min = float(np.nanmin(flow_abs))
+	peak_index = int(np.nanargmax(flow_abs))
+	peak_time = float(time_axis[peak_index])
+
+	recent_window = max(1, min(6, int(flow_abs.size - 1)))
+	q_prev = float(flow_abs[-1 - recent_window]) if flow_abs.size > 1 else q_end
+	delta_recent = q_end - q_prev
+	delta_total = q_end - q_start
+
+	trend_threshold = max(3.0, q_peak * 0.08)
+	dry_threshold = max(1.0, q_peak * 0.06)
+
+	if q_peak <= 1.0 or (q_end <= dry_threshold and q_mean <= max(25.0, q_peak * 0.35)):
+		confidence = min(0.98, 0.7 + (dry_threshold - min(q_end, dry_threshold)) / max(dry_threshold, 1.0) * 0.25)
+		label = "干枯"
+		reason = (
+			f"末时刻流量{q_end:.2f} m3/s，低于干枯阈值{dry_threshold:.2f} m3/s，"
+			f"整体峰值{q_peak:.2f} m3/s。"
+		)
+	elif q_end >= max(q_peak * 0.82, q_mean * 1.25) and q_peak >= max(80.0, q_mean * 1.2):
+		confidence = min(0.95, 0.6 + (q_end / max(q_peak, 1.0)) * 0.35)
+		label = "泄洪"
+		reason = (
+			f"当前流量{q_end:.2f} m3/s接近峰值{q_peak:.2f} m3/s，"
+			f"峰值出现在{peak_time:.0f}h，表现为高流量排放。"
+		)
+	elif delta_recent >= trend_threshold and delta_total > 0:
+		confidence = min(0.95, 0.55 + abs(delta_recent) / max(q_peak, 1.0) * 1.2)
+		label = "涨水"
+		reason = (
+			f"最近{recent_window}小时流量上升{delta_recent:.2f} m3/s，"
+			f"较起始时刻累计上升{delta_total:.2f} m3/s。"
+		)
+	elif delta_recent <= -trend_threshold and delta_total < 0:
+		confidence = min(0.95, 0.55 + abs(delta_recent) / max(q_peak, 1.0) * 1.2)
+		label = "退水"
+		reason = (
+			f"最近{recent_window}小时流量下降{abs(delta_recent):.2f} m3/s，"
+			f"较起始时刻累计下降{abs(delta_total):.2f} m3/s。"
+		)
+	else:
+		volatility = float(np.std(flow_abs) / max(q_mean, 1.0))
+		confidence = min(0.8, 0.45 + volatility * 0.35)
+		label = "稳态"
+		reason = (
+			f"当前流量{q_end:.2f} m3/s，峰值{q_peak:.2f} m3/s，"
+			f"最近变化幅度不显著。"
+		)
+
+	return {
+		"hydro_label": _normalize_hydro_label(label),
+		"confidence": float(max(0.0, min(1.0, confidence))),
+		"reason": reason,
+		"metrics": {
+			"q_start": q_start,
+			"q_end": q_end,
+			"q_min": q_min,
+			"q_mean": q_mean,
+			"q_peak": q_peak,
+			"peak_time": peak_time,
+			"delta_recent": float(delta_recent),
+			"delta_total": float(delta_total),
+		},
+	}
+
+
+def _judge_hydro_label_from_source(
+	*,
+	source_hdf_path: Path,
+	flow_hydrograph_ref: str,
+	flow_time_ref: str | None,
+) -> dict[str, Any]:
+	series_payload = _extract_flow_hydrograph_series(
+		hdf_path=source_hdf_path,
+		flow_hydrograph_ref=flow_hydrograph_ref,
+		flow_time_ref=flow_time_ref,
+	)
+	classification = _classify_hydro_state_from_series(series_payload.get("series", []))
+	return {
+		"source_hdf": str(source_hdf_path),
+		"flow_hydrograph_ref": flow_hydrograph_ref,
+		"flow_time_ref": flow_time_ref,
+		**series_payload,
+		**classification,
+	}
+
+
+def _compute_and_persist_project_hydro_label(
+	*,
+	project: Project,
+	db: Session,
+	force: bool = False,
+	mode: str = "rule",
+) -> dict[str, Any]:
+	mode_normalized = str(mode).strip().lower()
+	if mode_normalized not in {"rule", "ai", "hybrid"}:
+		mode_normalized = "rule"
+
+	if (
+		not force
+		and mode_normalized in {"rule", "hybrid"}
+		and project.hydro_label
+		and project.hydro_label_updated_at is not None
+		and project.flow_hdf_path
+		and project.flow_hydrograph_ref
+	):
+		return {
+			"project_id": project.id,
+			"found": True,
+			"hydro_label": _normalize_hydro_label(project.hydro_label),
+			"confidence": float(project.hydro_label_confidence or 0.0),
+			"reason": "",
+			"flow_hdf_path": project.flow_hdf_path,
+			"flow_hydrograph_ref": project.flow_hydrograph_ref,
+			"flow_time_ref": project.flow_time_ref,
+			"mode": mode_normalized,
+			"label_source": "cache",
+			"cached": True,
+		}
+
+	project_hdf_path = Path(project.hdf_path).resolve()
+	if not project_hdf_path.exists():
+		project.hydro_label = "稳态"
+		project.hydro_label_confidence = 0.2
+		project.hydro_label_updated_at = datetime.now(timezone.utc)
+		db.add(project)
+		db.commit()
+		return {
+			"project_id": project.id,
+			"found": False,
+			"hydro_label": project.hydro_label,
+			"confidence": float(project.hydro_label_confidence or 0.0),
+			"reason": "项目HDF文件不存在，无法判断。",
+			"mode": mode_normalized,
+			"label_source": "rule",
+			"cached": False,
+		}
+
+	source_hdf_path = Path(project.flow_hdf_path).resolve() if project.flow_hdf_path else None
+	flow_hydrograph_ref = project.flow_hydrograph_ref
+	flow_time_ref = project.flow_time_ref
+	if source_hdf_path is None or not source_hdf_path.exists() or not flow_hydrograph_ref:
+		source_hdf_path, flow_hydrograph_ref, flow_time_ref = _resolve_project_flow_source(project_hdf_path)
+
+	if source_hdf_path is None or flow_hydrograph_ref is None:
+		project.hydro_label = "稳态"
+		project.hydro_label_confidence = 0.2
+		project.hydro_label_updated_at = datetime.now(timezone.utc)
+		db.add(project)
+		db.commit()
+		return {
+			"project_id": project.id,
+			"found": False,
+			"hydro_label": project.hydro_label,
+			"confidence": float(project.hydro_label_confidence or 0.0),
+			"reason": "未找到可用的上游非恒定流曲线。",
+			"mode": mode_normalized,
+			"label_source": "rule",
+			"cached": False,
+		}
+
+	payload = _judge_hydro_label_from_source(
+		source_hdf_path=source_hdf_path,
+		flow_hydrograph_ref=flow_hydrograph_ref,
+		flow_time_ref=flow_time_ref,
+	)
+	rule_label = _normalize_hydro_label(payload.get("hydro_label"))
+	rule_confidence = _clamp_confidence(payload.get("confidence"), default=0.55)
+	rule_reason = str(payload.get("reason") or "规则判别完成。")
+	label_source = "rule"
+	model_name = None
+	final_label = rule_label
+	final_confidence = rule_confidence
+	final_reason = rule_reason
+
+	if mode_normalized in {"ai", "hybrid"}:
+		ai_result = _call_hydro_label_model(project=project, rule_payload=payload)
+		if ai_result is not None:
+			final_label = _normalize_hydro_label(ai_result.get("hydro_label"))
+			final_confidence = _clamp_confidence(ai_result.get("confidence"), default=0.65)
+			final_reason = str(ai_result.get("reason") or rule_reason)
+			label_source = str(ai_result.get("label_source") or "ai")
+			model_name = ai_result.get("model_name")
+		elif mode_normalized == "ai":
+			final_label = rule_label
+			final_confidence = rule_confidence
+			final_reason = f"AI不可用，已回退规则判别。{rule_reason}"
+			label_source = "rule-fallback"
+
+	project.flow_hdf_path = str(source_hdf_path)
+	project.flow_hydrograph_ref = flow_hydrograph_ref
+	project.flow_time_ref = flow_time_ref
+	project.hydro_label = final_label
+	project.hydro_label_confidence = final_confidence
+	project.hydro_label_updated_at = datetime.now(timezone.utc)
+	db.add(project)
+	db.commit()
+
+	return {
+		"project_id": project.id,
+		"found": True,
+		"hydro_label": project.hydro_label,
+		"confidence": float(project.hydro_label_confidence or 0.0),
+		"reason": final_reason,
+		"mode": mode_normalized,
+		"label_source": label_source,
+		"model_name": model_name,
+		"flow_hdf_path": project.flow_hdf_path,
+		"flow_hydrograph_ref": project.flow_hydrograph_ref,
+		"flow_time_ref": project.flow_time_ref,
+		"cached": False,
+		"sample_count": payload.get("sample_count"),
+		"peak_flow": payload.get("peak_flow"),
+		"peak_time": payload.get("peak_time"),
+		"current_flow": payload.get("current_flow"),
+		"current_time": payload.get("current_time"),
+		"metrics": payload.get("metrics"),
+	}
+
+
 def _backfill_project_flow_metadata() -> None:
 	with Session(engine) as db:
 		projects = db.execute(select(Project)).scalars().all()
@@ -692,6 +1438,14 @@ def _backfill_project_flow_metadata() -> None:
 			updated = True
 		if updated:
 			db.commit()
+
+		projects_need_label = db.execute(select(Project).where(Project.hydro_label.is_(None))).scalars().all()
+		default_mode = _default_hydro_label_mode()
+		for project in projects_need_label:
+			try:
+				_compute_and_persist_project_hydro_label(project=project, db=db, force=False, mode=default_mode)
+			except Exception:
+				db.rollback()
 
 
 def _build_square_tile_bounds(
@@ -950,6 +1704,7 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 def on_startup() -> None:
 	Base.metadata.create_all(bind=engine)
 	_ensure_projects_table_columns()
+	_prune_projects_table_columns()
 	_backfill_project_flow_metadata()
 
 
@@ -985,6 +1740,7 @@ def get_project_cards(
 			created_at = created.isoformat()
 		else:
 			created_at = ""
+		hydro_label = _normalize_hydro_label(project.hydro_label)
 
 		result.append(
 			{
@@ -996,6 +1752,8 @@ def get_project_cards(
 				"bbox_miny": project.bbox_miny,
 				"bbox_maxx": project.bbox_maxx,
 				"bbox_maxy": project.bbox_maxy,
+				"hydro_label": hydro_label,
+				"hydro_label_confidence": project.hydro_label_confidence,
 				"flow_ready": bool(project.flow_hdf_path and project.flow_hydrograph_ref),
 			}
 		)
@@ -1125,6 +1883,16 @@ def create_project(
 		db.rollback()
 		raise HTTPException(status_code=400, detail=f"数据库错误: {e}")
 
+	try:
+		_compute_and_persist_project_hydro_label(
+			project=project,
+			db=db,
+			force=True,
+			mode=_default_hydro_label_mode(),
+		)
+	except Exception:
+		db.rollback()
+
 	return {"ok": True, "project_id": project.id}
 
 
@@ -1188,6 +1956,34 @@ def get_project_flow_hydrograph(
 		"flow_time_ref": flow_time_ref,
 		**series_payload,
 	}
+
+
+@app.get("/api/projects/{project_id}/hydro-ai-summary")
+def get_project_hydro_ai_summary(
+	project_id: int,
+	db: Session = Depends(get_db),
+) -> dict[str, Any]:
+	project = db.get(Project, project_id)
+	if project is None:
+		raise HTTPException(status_code=404, detail="Project not found")
+
+	return _compute_project_hydro_ai_summary(project=project, db=db)
+
+
+@app.post("/api/projects/{project_id}/hydro-label/judge")
+def judge_project_hydro_label(
+	project_id: int,
+	force: bool = Query(default=False),
+	mode: str | None = Query(default=None, pattern="^(rule|ai|hybrid)$"),
+	db: Session = Depends(get_db),
+) -> dict[str, Any]:
+	project = db.get(Project, project_id)
+	if project is None:
+		raise HTTPException(status_code=404, detail="Project not found")
+
+	effective_mode = mode or _default_hydro_label_mode()
+	result = _compute_and_persist_project_hydro_label(project=project, db=db, force=force, mode=effective_mode)
+	return result
 
 
 @app.get("/api/projects/{project_id}/tif-points")

@@ -7,7 +7,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Cesium.js"></script>
     <link href="https://cesium.com/downloads/cesiumjs/releases/1.114/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
-    <link rel="stylesheet" href="/assets/css/test.css?v=20260401d">
+    <link rel="stylesheet" href="/assets/css/test.css?v=20260403f">
 </head>
 <body class="h-screen flex flex-col">
 
@@ -57,11 +57,17 @@
         <section class="w-[60%] flex flex-col overflow-hidden">
             
             <div class="h-[36%] section-divider hydro-panel p-4">
-                <div class="flex justify-between items-center mb-3">
-                    <div>
-                        <span class="hydro-kicker">Hydro Intelligence</span>
-                        <h3 class="hydro-title">动态水动力总览</h3>
+                <div class="hydro-overview-head mb-3">
+                    <div class="hydro-ai-inline">
+                        <button id="label-ai-trigger" class="label-ai-trigger" type="button" aria-label="AI概括">
+                            <span class="label-ai-trigger__text">AI总结</span>
+                        </button>
+
+                        <div id="hydroAiInsightBubble" class="hydro-ai-bubble">
+                            <p id="hydroAiInsightText" class="hydro-ai-bubble__text">点击 AI总结 获取右侧评价</p>
+                        </div>
                     </div>
+
                     <div class="flex gap-4 text-[10px] text-gray-400">
                         <div class="flex items-center gap-1.5"><span class="w-2 h-2 bg-cyan-400 rounded-full"></span><span>末时刻栅格</span></div>
                         <div class="flex items-center gap-1.5"><span class="w-2 h-2 bg-emerald-400 rounded-full"></span><span>边界入流曲线</span></div>
@@ -122,8 +128,8 @@
     <div id="deleteProjectModalRoot"></div>
 
 </body>
-<script src="/assets/js/project-cards.js?v=20260401d"></script>
-<script src="/assets/js/new-project.js?v=20260401d"></script>
+<script src="/assets/js/project-cards.js?v=20260403f"></script>
+<script src="/assets/js/new-project.js?v=20260403f"></script>
 <script src="/assets/vendor/echarts.min.js"></script>
-<script src="/assets/js/test.js?v=20260401d"></script>
+<script src="/assets/js/test.js?v=20260403f"></script>
 </html>
