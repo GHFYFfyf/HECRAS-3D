@@ -742,23 +742,10 @@ def _resolve_hydro_model_config() -> tuple[str, str, str]:
 
 
 def _default_hydro_label_mode() -> str:
-	raw_mode = str(os.getenv("HYDRO_LABEL_DEFAULT_MODE") or "hybrid").strip().lower()
-	if raw_mode in {"rule", "ai", "hybrid"}:
-		return raw_mode
-	return "hybrid"
-
-
-def _resolve_hydro_summary_temperature() -> float:
-	raw_value = str(os.getenv("HYDRO_SUMMARY_TEMPERATURE") or "").strip()
-	if not raw_value:
-		return 0.65
-	try:
-		temperature = float(raw_value)
-	except (TypeError, ValueError):
-		return 0.65
-	if not np.isfinite(temperature):
-		return 0.65
-	return float(max(0.0, min(1.5, temperature)))
+	raw_mode = str(os.getenv("HYDRO_LABEL_DEFAULT_MODE") or "ai").strip().lower()
+	if raw_mode == "ai":
+		return "ai"
+	return "ai"
 
 
 def _to_wgs84_point(x: float, y: float, source_crs_text: str | None) -> tuple[float | None, float | None]:
@@ -1027,16 +1014,15 @@ def _call_hydro_summary_model(
 
 	system_prompt = (
 		"你是水文分析助手。"
-		"请根据流量曲线和项目地理信息，给出简洁、自然、可读的现场判断。"
-		"必须输出JSON对象，格式为："
-		"{\"summary\":\"一句核心判断\",\"geo\":\"一句地理提示，可为空\",\"water_level\":\"一句水位/流量评价\"}。"
-		"允许措辞有变化，不要使用固定模板。"
-		"整体文字保持短句，适配两行内阅读。"
+		"请根据流量曲线和项目地理信息，给出极简、可读的现场判断。"
+		"必须输出严格JSON对象，格式为："
+		"{\"summary\":\"不超过36字\",\"geo\":\"不超过28字\",\"water_level\":\"不超过36字\"}。"
+		"其中 geo 必须体现大致经纬度或地理方位，water_level 必须包含水位/流量高低评价。"
 	)
 
 	request_payload = {
 		"model": model_name,
-		"temperature": _resolve_hydro_summary_temperature(),
+		"temperature": 0.25,
 		"messages": [
 			{"role": "system", "content": system_prompt},
 			{"role": "user", "content": json.dumps(model_input, ensure_ascii=False)},
@@ -1184,101 +1170,6 @@ def _compute_project_hydro_ai_summary(*, project: Project, db: Session) -> dict[
 	}
 
 
-def _classify_hydro_state_from_series(series: list[list[float]]) -> dict[str, Any]:
-	if not series:
-		return {
-			"hydro_label": "稳态",
-			"confidence": 0.2,
-			"reason": "缺少有效流量序列，默认按稳态处理。",
-		}
-
-	arr = np.asarray(series, dtype=np.float64)
-	if arr.ndim != 2 or arr.shape[1] < 2:
-		return {
-			"hydro_label": "稳态",
-			"confidence": 0.2,
-			"reason": "流量序列结构异常，默认按稳态处理。",
-		}
-
-	time_axis = arr[:, 0]
-	flow_abs = np.abs(arr[:, 1])
-	if flow_abs.size == 0 or not np.isfinite(flow_abs).any():
-		return {
-			"hydro_label": "稳态",
-			"confidence": 0.2,
-			"reason": "流量序列无有效值，默认按稳态处理。",
-		}
-
-	q_start = float(flow_abs[0])
-	q_end = float(flow_abs[-1])
-	q_peak = float(np.nanmax(flow_abs))
-	q_mean = float(np.nanmean(flow_abs))
-	q_min = float(np.nanmin(flow_abs))
-	peak_index = int(np.nanargmax(flow_abs))
-	peak_time = float(time_axis[peak_index])
-
-	recent_window = max(1, min(6, int(flow_abs.size - 1)))
-	q_prev = float(flow_abs[-1 - recent_window]) if flow_abs.size > 1 else q_end
-	delta_recent = q_end - q_prev
-	delta_total = q_end - q_start
-
-	trend_threshold = max(3.0, q_peak * 0.08)
-	dry_threshold = max(1.0, q_peak * 0.06)
-
-	if q_peak <= 1.0 or (q_end <= dry_threshold and q_mean <= max(25.0, q_peak * 0.35)):
-		confidence = min(0.98, 0.7 + (dry_threshold - min(q_end, dry_threshold)) / max(dry_threshold, 1.0) * 0.25)
-		label = "干枯"
-		reason = (
-			f"末时刻流量{q_end:.2f} m3/s，低于干枯阈值{dry_threshold:.2f} m3/s，"
-			f"整体峰值{q_peak:.2f} m3/s。"
-		)
-	elif q_end >= max(q_peak * 0.82, q_mean * 1.25) and q_peak >= max(80.0, q_mean * 1.2):
-		confidence = min(0.95, 0.6 + (q_end / max(q_peak, 1.0)) * 0.35)
-		label = "泄洪"
-		reason = (
-			f"当前流量{q_end:.2f} m3/s接近峰值{q_peak:.2f} m3/s，"
-			f"峰值出现在{peak_time:.0f}h，表现为高流量排放。"
-		)
-	elif delta_recent >= trend_threshold and delta_total > 0:
-		confidence = min(0.95, 0.55 + abs(delta_recent) / max(q_peak, 1.0) * 1.2)
-		label = "涨水"
-		reason = (
-			f"最近{recent_window}小时流量上升{delta_recent:.2f} m3/s，"
-			f"较起始时刻累计上升{delta_total:.2f} m3/s。"
-		)
-	elif delta_recent <= -trend_threshold and delta_total < 0:
-		confidence = min(0.95, 0.55 + abs(delta_recent) / max(q_peak, 1.0) * 1.2)
-		label = "退水"
-		reason = (
-			f"最近{recent_window}小时流量下降{abs(delta_recent):.2f} m3/s，"
-			f"较起始时刻累计下降{abs(delta_total):.2f} m3/s。"
-		)
-	else:
-		volatility = float(np.std(flow_abs) / max(q_mean, 1.0))
-		confidence = min(0.8, 0.45 + volatility * 0.35)
-		label = "稳态"
-		reason = (
-			f"当前流量{q_end:.2f} m3/s，峰值{q_peak:.2f} m3/s，"
-			f"最近变化幅度不显著。"
-		)
-
-	return {
-		"hydro_label": _normalize_hydro_label(label),
-		"confidence": float(max(0.0, min(1.0, confidence))),
-		"reason": reason,
-		"metrics": {
-			"q_start": q_start,
-			"q_end": q_end,
-			"q_min": q_min,
-			"q_mean": q_mean,
-			"q_peak": q_peak,
-			"peak_time": peak_time,
-			"delta_recent": float(delta_recent),
-			"delta_total": float(delta_total),
-		},
-	}
-
-
 def _judge_hydro_label_from_source(
 	*,
 	source_hdf_path: Path,
@@ -1290,13 +1181,11 @@ def _judge_hydro_label_from_source(
 		flow_hydrograph_ref=flow_hydrograph_ref,
 		flow_time_ref=flow_time_ref,
 	)
-	classification = _classify_hydro_state_from_series(series_payload.get("series", []))
 	return {
 		"source_hdf": str(source_hdf_path),
 		"flow_hydrograph_ref": flow_hydrograph_ref,
 		"flow_time_ref": flow_time_ref,
 		**series_payload,
-		**classification,
 	}
 
 
@@ -1305,15 +1194,13 @@ def _compute_and_persist_project_hydro_label(
 	project: Project,
 	db: Session,
 	force: bool = False,
-	mode: str = "rule",
+	mode: str = "ai",
 ) -> dict[str, Any]:
-	mode_normalized = str(mode).strip().lower()
-	if mode_normalized not in {"rule", "ai", "hybrid"}:
-		mode_normalized = "rule"
+	_ = mode
+	mode_normalized = "ai"
 
 	if (
 		not force
-		and mode_normalized in {"rule", "hybrid"}
 		and project.hydro_label
 		and project.hydro_label_updated_at is not None
 		and project.flow_hdf_path
@@ -1335,19 +1222,14 @@ def _compute_and_persist_project_hydro_label(
 
 	project_hdf_path = Path(project.hdf_path).resolve()
 	if not project_hdf_path.exists():
-		project.hydro_label = "稳态"
-		project.hydro_label_confidence = 0.2
-		project.hydro_label_updated_at = datetime.now(timezone.utc)
-		db.add(project)
-		db.commit()
 		return {
 			"project_id": project.id,
 			"found": False,
-			"hydro_label": project.hydro_label,
-			"confidence": float(project.hydro_label_confidence or 0.0),
-			"reason": "项目HDF文件不存在，无法判断。",
+			"hydro_label": None,
+			"confidence": 0.0,
+			"reason": "项目HDF文件不存在，无法进行AI判别。",
 			"mode": mode_normalized,
-			"label_source": "rule",
+			"label_source": "ai-unavailable",
 			"cached": False,
 		}
 
@@ -1358,19 +1240,14 @@ def _compute_and_persist_project_hydro_label(
 		source_hdf_path, flow_hydrograph_ref, flow_time_ref = _resolve_project_flow_source(project_hdf_path)
 
 	if source_hdf_path is None or flow_hydrograph_ref is None:
-		project.hydro_label = "稳态"
-		project.hydro_label_confidence = 0.2
-		project.hydro_label_updated_at = datetime.now(timezone.utc)
-		db.add(project)
-		db.commit()
 		return {
 			"project_id": project.id,
 			"found": False,
-			"hydro_label": project.hydro_label,
-			"confidence": float(project.hydro_label_confidence or 0.0),
-			"reason": "未找到可用的上游非恒定流曲线。",
+			"hydro_label": None,
+			"confidence": 0.0,
+			"reason": "未找到可用的上游非恒定流曲线，无法进行AI判别。",
 			"mode": mode_normalized,
-			"label_source": "rule",
+			"label_source": "ai-unavailable",
 			"cached": False,
 		}
 
@@ -1379,28 +1256,24 @@ def _compute_and_persist_project_hydro_label(
 		flow_hydrograph_ref=flow_hydrograph_ref,
 		flow_time_ref=flow_time_ref,
 	)
-	rule_label = _normalize_hydro_label(payload.get("hydro_label"))
-	rule_confidence = _clamp_confidence(payload.get("confidence"), default=0.55)
-	rule_reason = str(payload.get("reason") or "规则判别完成。")
-	label_source = "rule"
-	model_name = None
-	final_label = rule_label
-	final_confidence = rule_confidence
-	final_reason = rule_reason
+	ai_result = _call_hydro_label_model(project=project, rule_payload=payload)
+	if ai_result is None:
+		return {
+			"project_id": project.id,
+			"found": False,
+			"hydro_label": None,
+			"confidence": 0.0,
+			"reason": "AI判别不可用。",
+			"mode": mode_normalized,
+			"label_source": "ai-unavailable",
+			"cached": False,
+		}
 
-	if mode_normalized in {"ai", "hybrid"}:
-		ai_result = _call_hydro_label_model(project=project, rule_payload=payload)
-		if ai_result is not None:
-			final_label = _normalize_hydro_label(ai_result.get("hydro_label"))
-			final_confidence = _clamp_confidence(ai_result.get("confidence"), default=0.65)
-			final_reason = str(ai_result.get("reason") or rule_reason)
-			label_source = str(ai_result.get("label_source") or "ai")
-			model_name = ai_result.get("model_name")
-		elif mode_normalized == "ai":
-			final_label = rule_label
-			final_confidence = rule_confidence
-			final_reason = f"AI不可用，已回退规则判别。{rule_reason}"
-			label_source = "rule-fallback"
+	final_label = _normalize_hydro_label(ai_result.get("hydro_label"))
+	final_confidence = _clamp_confidence(ai_result.get("confidence"), default=0.65)
+	final_reason = str(ai_result.get("reason") or "AI已完成判别。")
+	label_source = str(ai_result.get("label_source") or "ai")
+	model_name = ai_result.get("model_name")
 
 	project.flow_hdf_path = str(source_hdf_path)
 	project.flow_hydrograph_ref = flow_hydrograph_ref
@@ -1975,16 +1848,11 @@ def get_project_flow_hydrograph(
 @app.get("/api/projects/{project_id}/hydro-ai-summary")
 def get_project_hydro_ai_summary(
 	project_id: int,
-	response: FastAPIResponse,
 	db: Session = Depends(get_db),
 ) -> dict[str, Any]:
 	project = db.get(Project, project_id)
 	if project is None:
 		raise HTTPException(status_code=404, detail="Project not found")
-
-	response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-	response.headers["Pragma"] = "no-cache"
-	response.headers["Expires"] = "0"
 
 	return _compute_project_hydro_ai_summary(project=project, db=db)
 
@@ -1993,7 +1861,7 @@ def get_project_hydro_ai_summary(
 def judge_project_hydro_label(
 	project_id: int,
 	force: bool = Query(default=False),
-	mode: str | None = Query(default=None, pattern="^(rule|ai|hybrid)$"),
+	mode: str | None = Query(default=None, pattern="^(ai)$"),
 	db: Session = Depends(get_db),
 ) -> dict[str, Any]:
 	project = db.get(Project, project_id)
