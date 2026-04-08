@@ -18,6 +18,7 @@
 
 - `DEEPSEEK_MODEL`，默认 `deepseek-chat`
 - `DEEPSEEK_BASE_URL`，默认 `https://api.deepseek.com`
+- `HYDRO_SUMMARY_TEMPERATURE`，控制 AI 概括温度，默认 `0.65`
 - `HYDRO_LABEL_DEFAULT_MODE`，可选 `rule` / `ai` / `hybrid`，默认 `hybrid`
 
 说明：

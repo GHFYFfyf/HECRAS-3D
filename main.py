@@ -748,6 +748,19 @@ def _default_hydro_label_mode() -> str:
 	return "hybrid"
 
 
+def _resolve_hydro_summary_temperature() -> float:
+	raw_value = str(os.getenv("HYDRO_SUMMARY_TEMPERATURE") or "").strip()
+	if not raw_value:
+		return 0.65
+	try:
+		temperature = float(raw_value)
+	except (TypeError, ValueError):
+		return 0.65
+	if not np.isfinite(temperature):
+		return 0.65
+	return float(max(0.0, min(1.5, temperature)))
+
+
 def _to_wgs84_point(x: float, y: float, source_crs_text: str | None) -> tuple[float | None, float | None]:
 	if not source_crs_text:
 		return None, None
@@ -1014,15 +1027,16 @@ def _call_hydro_summary_model(
 
 	system_prompt = (
 		"你是水文分析助手。"
-		"请根据流量曲线和项目地理信息，给出极简、可读的现场判断。"
-		"必须输出严格JSON对象，格式为："
-		"{\"summary\":\"不超过36字\",\"geo\":\"不超过28字\",\"water_level\":\"不超过36字\"}。"
-		"其中 geo 必须体现大致经纬度或地理方位，water_level 必须包含水位/流量高低评价。"
+		"请根据流量曲线和项目地理信息，给出简洁、自然、可读的现场判断。"
+		"必须输出JSON对象，格式为："
+		"{\"summary\":\"一句核心判断\",\"geo\":\"一句地理提示，可为空\",\"water_level\":\"一句水位/流量评价\"}。"
+		"允许措辞有变化，不要使用固定模板。"
+		"整体文字保持短句，适配两行内阅读。"
 	)
 
 	request_payload = {
 		"model": model_name,
-		"temperature": 0.25,
+		"temperature": _resolve_hydro_summary_temperature(),
 		"messages": [
 			{"role": "system", "content": system_prompt},
 			{"role": "user", "content": json.dumps(model_input, ensure_ascii=False)},
@@ -1961,11 +1975,16 @@ def get_project_flow_hydrograph(
 @app.get("/api/projects/{project_id}/hydro-ai-summary")
 def get_project_hydro_ai_summary(
 	project_id: int,
+	response: FastAPIResponse,
 	db: Session = Depends(get_db),
 ) -> dict[str, Any]:
 	project = db.get(Project, project_id)
 	if project is None:
 		raise HTTPException(status_code=404, detail="Project not found")
+
+	response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+	response.headers["Pragma"] = "no-cache"
+	response.headers["Expires"] = "0"
 
 	return _compute_project_hydro_ai_summary(project=project, db=db)
 

@@ -168,9 +168,17 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
 
     async function fetchHydroAiSummaryPayload(projectId) {
+        const cacheBuster = Date.now();
         const response = await fetch(
-            `/api/projects/${encodeURIComponent(projectId)}/hydro-ai-summary`,
-            { headers: { Accept: "application/json" } }
+            `/api/projects/${encodeURIComponent(projectId)}/hydro-ai-summary?refresh_token=${cacheBuster}`,
+            {
+                cache: "no-store",
+                headers: {
+                    Accept: "application/json",
+                    "Cache-Control": "no-cache",
+                    Pragma: "no-cache",
+                },
+            }
         );
 
         if (!response.ok) {
