@@ -498,9 +498,9 @@
 
         /**
          * parseTifTileBinaryPayload
-         * Function: Decode compact tile binary payload into legacy JSON-like shape.
+         * Function: Decode compact tile binary payload and keep typed arrays.
          * Input: ArrayBuffer from /tif-tile-points-binary.
-         * Output: { project_id, point_count, stride, window, grid, vertices, points }.
+         * Output: { project_id, point_count, stride, window, grid, _binary_arrays, ... }.
          */
         parseTifTileBinaryPayload(buffer) {
             const view = new DataView(buffer);
@@ -572,38 +572,34 @@
             offset += f32Bytes;
             const valid = new Uint8Array(buffer, offset, sampleCount);
 
-            const vertices = new Array(sampleCount);
-            const points = [];
+            // Keep compact typed arrays in cache to avoid parse-stage object churn.
+            let validPointCount = 0;
             for (let i = 0; i < sampleCount; i += 1) {
-                const row = rows[i];
-                const col = cols[i];
-                const x = Number(xVals[i]);
-                const y = Number(yVals[i]);
                 const z = Number(zVals[i]);
                 const isValid = valid[i] !== 0 && Number.isFinite(z);
-
-                vertices[i] = {
-                    sample_row: row,
-                    sample_col: col,
-                    row,
-                    col,
-                    x,
-                    y,
-                    elevation: isValid ? z : null,
-                    valid: isValid,
-                };
-
                 if (isValid) {
-                    points.push([x, y, z]);
+                    validPointCount += 1;
                 }
             }
 
+            const binaryArrays = {
+                rows,
+                cols,
+                xVals,
+                yVals,
+                zVals,
+                valid,
+                sampleCount,
+            };
+
             return {
                 project_id: projectIdFromPayload,
-                point_count: Number.isFinite(pointCountFromHeader) ? pointCountFromHeader : points.length,
+                point_count: Number.isFinite(pointCountFromHeader) ? pointCountFromHeader : validPointCount,
+                sample_count: sampleCount,
                 stride,
                 _binary_header: headerSummary,
                 _binary_head_hex: hexPreview,
+                _binary_arrays: binaryArrays,
                 window: {
                     row_start: rowStart,
                     row_end: rowEnd,
@@ -614,8 +610,9 @@
                     rows: gridRows,
                     cols: gridCols,
                 },
-                vertices,
-                points,
+                // Keep legacy fields for compatibility but avoid heavy allocations here.
+                vertices: [],
+                points: [],
             };
         },
 
@@ -626,8 +623,45 @@
          * Output: none (side effect: console log).
          */
         logPayloadSamples(payload) {
-            const vertices = Array.isArray(payload.vertices) ? payload.vertices : [];
-            const pointsFromPayload = Array.isArray(payload.points) ? payload.points : [];
+            let vertices = Array.isArray(payload.vertices) ? payload.vertices : [];
+            let pointsFromPayload = Array.isArray(payload.points) ? payload.points : [];
+
+            if ((!vertices.length || !pointsFromPayload.length) && payload && payload._binary_arrays) {
+                const arrays = payload._binary_arrays;
+                const rows = arrays.rows;
+                const cols = arrays.cols;
+                const xVals = arrays.xVals;
+                const yVals = arrays.yVals;
+                const zVals = arrays.zVals;
+                const valid = arrays.valid;
+                const sampleCount = Math.min(
+                    rows?.length || 0,
+                    cols?.length || 0,
+                    xVals?.length || 0,
+                    yVals?.length || 0,
+                    zVals?.length || 0,
+                    valid?.length || 0,
+                );
+                const previewVertices = [];
+                const previewPoints = [];
+                for (let i = 0; i < sampleCount && previewVertices.length < 5; i += 1) {
+                    const z = Number(zVals[i]);
+                    const isValid = valid[i] !== 0 && Number.isFinite(z);
+                    previewVertices.push({
+                        sample_row: Number(rows[i]),
+                        sample_col: Number(cols[i]),
+                        x: Number(xVals[i]),
+                        y: Number(yVals[i]),
+                        elevation: isValid ? z : null,
+                        valid: isValid,
+                    });
+                    if (isValid && previewPoints.length < 5) {
+                        previewPoints.push([Number(xVals[i]), Number(yVals[i]), z]);
+                    }
+                }
+                vertices = vertices.length ? vertices : previewVertices;
+                pointsFromPayload = pointsFromPayload.length ? pointsFromPayload : previewPoints;
+            }
 
             console.log("[tif-points] summary", {
                 project_id: payload.project_id,
@@ -832,13 +866,15 @@
          * Input: vertices, centerX/centerY (reserved), minZ, zRange, sampleStep.
          * Output: THREE.Mesh or null.
          */
-        createIndexedSurfaceMesh(vertices, centerX, centerY, minZ, zRange, sampleStep = 1) {
+        createIndexedSurfaceMesh(vertices, centerX, centerY, minZ, zRange, sampleStep = 1, sampleKeySpan = 1) {
             if (!Array.isArray(vertices) || !vertices.length) {
                 return null;
             }
 
             const keyToGeometryIndex = new Map();
             const geometryPositions = [];
+            const keySpan = Math.max(1, Math.trunc(sampleKeySpan) || 1);
+            const makeSampleKey = (row, col) => row * keySpan + col;
             const getColorForZ = (zValue) => {
                 const t = THREE.MathUtils.clamp((zValue - minZ) / Math.max(zRange, 1e-9), 0, 1);
                 return MeshModule.sampleElevationRamp(t);
@@ -858,8 +894,10 @@
                 if (!Number.isFinite(sampleRow) || !Number.isFinite(sampleCol) || !Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
                     continue;
                 }
+                const row = Math.trunc(sampleRow);
+                const col = Math.trunc(sampleCol);
 
-                const key = `${sampleRow}_${sampleCol}`;
+                const key = makeSampleKey(row, col);
                 keyToGeometryIndex.set(key, geometryPositions.length / 3);
                 geometryPositions.push(x, y, z);
             }
@@ -871,22 +909,14 @@
             }
 
             const triangleIndices = [];
-            for (const key of keyToGeometryIndex.keys()) {
-                const parts = key.split("_");
-                if (parts.length !== 2) {
-                    continue;
-                }
+            for (const packedKey of keyToGeometryIndex.keys()) {
+                const row = Math.trunc(packedKey / keySpan);
+                const col = packedKey - row * keySpan;
 
-                const row = Number(parts[0]);
-                const col = Number(parts[1]);
-                if (!Number.isFinite(row) || !Number.isFinite(col)) {
-                    continue;
-                }
-
-                const i00 = keyToGeometryIndex.get(`${row}_${col}`);
-                const i01 = keyToGeometryIndex.get(`${row}_${col + colStep}`);
-                const i10 = keyToGeometryIndex.get(`${row + rowStep}_${col}`);
-                const i11 = keyToGeometryIndex.get(`${row + rowStep}_${col + colStep}`);
+                const i00 = keyToGeometryIndex.get(makeSampleKey(row, col));
+                const i01 = keyToGeometryIndex.get(makeSampleKey(row, col + colStep));
+                const i10 = keyToGeometryIndex.get(makeSampleKey(row + rowStep, col));
+                const i11 = keyToGeometryIndex.get(makeSampleKey(row + rowStep, col + colStep));
 
                 if (i00 == null || i01 == null || i10 == null || i11 == null) {
                     continue;
@@ -1143,6 +1173,7 @@
         const bboxMinY = Number(meta.bbox_miny);
         const bboxMaxX = Number(meta.bbox_maxx);
         const bboxMaxY = Number(meta.bbox_maxy);
+        const sampleKeySpan = Math.max(1, (Math.trunc(Number(meta.width)) || 0) + 1);
         let globalColorMinZ = Number.isFinite(metaZMin) ? metaZMin : Number.POSITIVE_INFINITY;
         let globalColorMaxZ = Number.isFinite(metaZMax) ? metaZMax : Number.NEGATIVE_INFINITY;
         let globalColorZRange = Math.max(globalColorMaxZ - globalColorMinZ, 1e-9);
@@ -1495,12 +1526,61 @@
         const rebuildSceneFromVisibleTiles = (visibleTiles, sampleStep) => {
             const renderStartAt = performance.now();
             const uniqueVertexByKey = new Map();
+            const makeSampleKey = (row, col) => row * sampleKeySpan + col;
 
             for (let i = 0; i < visibleTiles.length; i += 1) {
                 const cached = tileCache.get(tileKey(visibleTiles[i]));
                 if (!cached) {
                     continue;
                 }
+
+                const binaryArrays = cached._binary_arrays;
+                if (binaryArrays) {
+                    const rows = binaryArrays.rows;
+                    const cols = binaryArrays.cols;
+                    const xVals = binaryArrays.xVals;
+                    const yVals = binaryArrays.yVals;
+                    const zVals = binaryArrays.zVals;
+                    const valid = binaryArrays.valid;
+                    const sampleCount = Math.min(
+                        rows?.length || 0,
+                        cols?.length || 0,
+                        xVals?.length || 0,
+                        yVals?.length || 0,
+                        zVals?.length || 0,
+                        valid?.length || 0,
+                    );
+
+                    for (let v = 0; v < sampleCount; v += 1) {
+                        const z = Number(zVals[v]);
+                        if (valid[v] === 0 || !Number.isFinite(z)) {
+                            continue;
+                        }
+                        const row = Number(rows[v]);
+                        const col = Number(cols[v]);
+                        const x = Number(xVals[v]);
+                        const y = Number(yVals[v]);
+                        if (!Number.isFinite(row) || !Number.isFinite(col) || !Number.isFinite(x) || !Number.isFinite(y)) {
+                            continue;
+                        }
+                        const rowInt = Math.trunc(row);
+                        const colInt = Math.trunc(col);
+                        const key = makeSampleKey(rowInt, colInt);
+                        if (!uniqueVertexByKey.has(key)) {
+                            uniqueVertexByKey.set(key, {
+                                sample_row: rowInt,
+                                sample_col: colInt,
+                                row: rowInt,
+                                col: colInt,
+                                x,
+                                y,
+                                elevation: z,
+                                valid: true,
+                            });
+                        }
+                    }
+                }
+
                 const payloadVertices = Array.isArray(cached.vertices) ? cached.vertices : [];
                 for (let v = 0; v < payloadVertices.length; v += 1) {
                     const vertex = payloadVertices[v];
@@ -1515,38 +1595,87 @@
                     if (!Number.isFinite(row) || !Number.isFinite(col) || !Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
                         continue;
                     }
-                    const key = `${row}_${col}`;
+                    const rowInt = Math.trunc(row);
+                    const colInt = Math.trunc(col);
+                    const key = makeSampleKey(rowInt, colInt);
                     if (!uniqueVertexByKey.has(key)) {
-                        uniqueVertexByKey.set(key, vertex);
+                        uniqueVertexByKey.set(key, {
+                            sample_row: rowInt,
+                            sample_col: colInt,
+                            row: rowInt,
+                            col: colInt,
+                            x,
+                            y,
+                            elevation: z,
+                            valid: true,
+                        });
                     }
                 }
             }
 
             const mergedVertices = Array.from(uniqueVertexByKey.values());
-            const mergedPoints = mergedVertices.map((vertex) => [Number(vertex.x), Number(vertex.y), Number(vertex.elevation)]);
-
-            if (!mergedPoints.length) {
+            if (!mergedVertices.length) {
                 return 0;
             }
 
-            const pointStats = DataModule.computePointStats(mergedPoints);
-            const centerX = pointStats.centerX;
-            const centerY = pointStats.centerY;
+            let sumX = 0;
+            let sumY = 0;
+            let validCount = 0;
+            let localMinZ = Number.POSITIVE_INFINITY;
+            let localMaxZ = Number.NEGATIVE_INFINITY;
+            for (let i = 0; i < mergedVertices.length; i += 1) {
+                const vertex = mergedVertices[i];
+                const x = Number(vertex.x);
+                const y = Number(vertex.y);
+                const z = Number(vertex.elevation);
+                if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+                    continue;
+                }
+                sumX += x;
+                sumY += y;
+                validCount += 1;
+                if (!Number.isFinite(globalColorMinZ) || !Number.isFinite(globalColorMaxZ)) {
+                    localMinZ = Math.min(localMinZ, z);
+                    localMaxZ = Math.max(localMaxZ, z);
+                }
+            }
+
+            if (validCount === 0) {
+                return 0;
+            }
+
+            const centerX = sumX / validCount;
+            const centerY = sumY / validCount;
             if (!Number.isFinite(globalColorMinZ) || !Number.isFinite(globalColorMaxZ)) {
-                globalColorMinZ = pointStats.minZ;
-                globalColorMaxZ = pointStats.maxZ;
+                globalColorMinZ = Number.isFinite(localMinZ) ? localMinZ : 0;
+                globalColorMaxZ = Number.isFinite(localMaxZ) ? localMaxZ : 1;
                 globalColorZRange = Math.max(globalColorMaxZ - globalColorMinZ, 1e-9);
             }
-            const positions = DataModule.buildCenteredPositions(mergedPoints, centerX, centerY);
-            const colors = new Float32Array(mergedPoints.length * 3);
-            for (let i = 0; i < mergedPoints.length; i += 1) {
-                const z = Number(mergedPoints[i][2]);
+
+            const positions = new Float32Array(validCount * 3);
+            const colors = new Float32Array(validCount * 3);
+            let cursor = 0;
+            for (let i = 0; i < mergedVertices.length; i += 1) {
+                const vertex = mergedVertices[i];
+                const x = Number(vertex.x);
+                const y = Number(vertex.y);
+                const z = Number(vertex.elevation);
+                if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+                    continue;
+                }
+                positions[cursor * 3] = x;
+                positions[cursor * 3 + 1] = y;
+                positions[cursor * 3 + 2] = z;
                 const t = THREE.MathUtils.clamp((z - globalColorMinZ) / Math.max(globalColorZRange, 1e-9), 0, 1);
                 const [r, g, b] = MeshModule.sampleElevationRamp(t);
-                colors[i * 3] = r;
-                colors[i * 3 + 1] = g;
-                colors[i * 3 + 2] = b;
+                colors[cursor * 3] = r;
+                colors[cursor * 3 + 1] = g;
+                colors[cursor * 3 + 2] = b;
+                cursor += 1;
             }
+
+            const activePositions = cursor === validCount ? positions : positions.subarray(0, cursor * 3);
+            const activeColors = cursor === validCount ? colors : colors.subarray(0, cursor * 3);
 
             if (cloud) {
                 cloud.geometry.dispose();
@@ -1555,7 +1684,7 @@
                 cloud = null;
             }
             if (SHOW_BASE_POINT_CLOUD) {
-                cloud = MeshModule.createWhitePointCloud(positions, colors);
+                cloud = MeshModule.createWhitePointCloud(activePositions, activeColors);
                 RenderModule.scene.add(cloud);
             }
 
@@ -1573,6 +1702,7 @@
                 globalColorMinZ,
                 globalColorZRange,
                 sampleStep,
+                sampleKeySpan,
             );
             if (terrainSurface) {
                 RenderModule.scene.add(terrainSurface);
@@ -1605,7 +1735,7 @@
             RenderModule.setLoadHudText(`${elapsedMs.toFixed(1)} ms | tiles ${visibleTiles.length}`);
             setPerfText(perfDom.frontendRender, formatMs(performance.now() - renderStartAt));
             setPerfText(perfDom.stage, "Terrain rebuild");
-            return mergedPoints.length;
+            return cursor;
         };
 
         const runWithConcurrency = async (taskFactories, limit) => {
@@ -1684,10 +1814,17 @@
             if (skipRebuild) {
                 for (let i = 0; i < visibleTiles.length; i += 1) {
                     const cached = tileCache.get(tileKey(visibleTiles[i]));
-                    if (!cached || !Array.isArray(cached.points)) {
+                    if (!cached) {
                         continue;
                     }
-                    renderedPointCount += cached.points.length;
+                    if (Array.isArray(cached.points)) {
+                        renderedPointCount += cached.points.length;
+                        continue;
+                    }
+                    const pointCount = Number(cached.point_count);
+                    if (Number.isFinite(pointCount) && pointCount > 0) {
+                        renderedPointCount += pointCount;
+                    }
                 }
             } else {
                 const rebuildStartAt = performance.now();
